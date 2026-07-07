@@ -2,6 +2,24 @@
 
 # Change Log
 
+## Jul-03-2026: Version 4.3.3
+
+- Release to create conda-forge package.
+
+## Jul-02-2026: Version 4.3.2
+
+- Added LAMMPS calculator interface with the Si-lammps-ace example and
+  documentation.
+- Improved the error message shown when reading FORCES_FC3 fails.
+
+## Jun-28-2026: Version 4.3.1
+
+- Release to create conda-forge package.
+
+## Jun-28-2026: Version 4.3.0
+
+- The Rust phonon solver now uses phonors batched diagonalization.
+
 ## Jun-21-2026: Version 4.2.0
 
 - Requires phonopy>=4.2.0.
