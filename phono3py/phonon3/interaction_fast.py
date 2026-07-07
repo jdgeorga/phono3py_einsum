@@ -833,6 +833,9 @@ class Interaction:
             self._bz_grid.grid_symmetry_dataset.translations,  # type: ignore
             np.array(self._primitive.cell.T, dtype="double", order="C"),
             symprec=self._symprec,
+            # phonopy 4.3 added a required `types` arg (atom permutation types);
+            # matches upstream phono3py fc3.py's supercell.permutation_types.
+            types=self._primitive.permutation_types,
         )
 
         for d_i, r_i in enumerate(d2r_map):
