@@ -249,6 +249,10 @@ class Interaction:
 
         num_band = len(self._primitive) * 3
         num_triplets = len(self._triplets_at_q)
+        print(f"num_triplets: {num_triplets}")
+        print(f"num_band: {num_band}")
+        print(f"len(self._band_indices): {len(self._band_indices)}")
+        
 
         self._interaction_strength = np.empty(
             (num_triplets, len(self._band_indices), num_band, num_band),

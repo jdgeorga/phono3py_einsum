@@ -116,7 +116,7 @@ from phono3py.phonon3.imag_self_energy import (
     get_imag_self_energy,
     write_imag_self_energy,
 )
-from phono3py.phonon3.interaction import Interaction
+from phono3py.phonon3.interaction_fast import Interaction
 from phono3py.phonon3.real_self_energy import (
     get_real_self_energy,
     write_real_self_energy,
@@ -210,7 +210,7 @@ class Phono3py:
         symprec: float = 1e-5,
         calculator: str | None = None,
         log_level: int = 0,
-        lang: Literal["C", "Rust"] = "Rust",
+        lang: Literal["C", "Python", "Rust", "GPU", "GPU_phase", "Hybrid"] = "Rust",
     ):
         """Init method.
 
@@ -276,10 +276,12 @@ class Phono3py:
             equivalent to ``"vasp"``.
         log_level : int, optional
             Verbosity control: ``0``, ``1``, or ``2``. Default is ``0``.
-        lang : Literal["C", "Rust"], optional
+        lang : str, optional
             Backend implementation for compute-heavy kernels. ``"C"``
             uses the existing C extension; ``"Rust"`` selects the
-            experimental phonors backend. Default is ``"Rust"``.
+            experimental phonors backend. GPU/einsum fork backends are
+            ``"GPU"``, ``"GPU_phase"``, and ``"Hybrid"``. Default is
+            ``"Rust"``.
 
         """
         self._symprec = symprec
@@ -302,7 +304,11 @@ class Phono3py:
         self._cutoff_frequency = cutoff_frequency
         self._calculator = calculator
         self._log_level = log_level
-        self._lang: Literal["C", "Rust"] = resolve_lang(lang)
+        if lang in ("C", "Rust"):
+            lang = resolve_lang(lang)
+        self._lang: Literal[
+            "C", "Python", "Rust", "GPU", "GPU_phase", "Hybrid"
+        ] = lang
 
         # Create supercell and primitive cell
         self._unitcell = unitcell
@@ -396,7 +402,7 @@ class Phono3py:
         return self._calculator
 
     @property
-    def lang(self) -> Literal["C", "Rust"]:
+    def lang(self) -> Literal["C", "Python", "Rust", "GPU", "GPU_phase", "Hybrid"]:
         """Return the selected backend implementation.
 
         ``"C"`` uses the existing C extension; ``"Rust"`` selects the
@@ -1374,6 +1380,7 @@ class Phono3py:
         random_seed: int | None = None,
         max_distance: float | None = None,
         number_estimation_factor: float | None = None,
+        is_layered: bool = False,
     ) -> None:
         """Generate the fc3 displacement dataset in the supercell.
 
@@ -1447,6 +1454,10 @@ class Phono3py:
             ``number_of_snapshots="auto"``. Default is ``None``, which
             uses ``8`` when ``max_distance`` is given and ``4``
             otherwise.
+        is_layered : bool, optional
+            When True, the cutoff distance is applied only to in-plane (xy)
+            coordinates for layered materials. This allows interlayer interactions
+            to be included while limiting intralayer interactions. Default is False.
 
         """
         if distance is None:
@@ -1495,6 +1506,7 @@ class Phono3py:
                 is_plusminus=is_plusminus,
                 is_diagonal=is_diagonal,
                 cutoff_pair_distance=cutoff_pair_distance,
+                is_layered=is_layered,
             )
         self._supercells_with_displacements = None
 
@@ -2060,7 +2072,9 @@ class Phono3py:
         write_txt: bool = False,
         write_gamma_detail: bool = False,
         keep_gamma_detail: bool = False,
+        keep_reduced_gamma_detail: bool = False,
         output_filename: str | None = None,
+        lang: Literal["C", "Python", "Rust", "GPU", "GPU_phase", "Hybrid"] = "C",
     ) -> ImagSelfEnergyValues:
         """Calculate the imaginary part of the bubble self-energy (Gamma).
 
@@ -2113,8 +2127,17 @@ class Phono3py:
             Keep per-scattering-event Gamma on the instance
             (accessible via :attr:`detailed_gammas`). Default is
             ``False``.
+        keep_reduced_gamma_detail : bool, optional
+            Keep only the band-summed reduced views of the detailed gamma
+            on the instance as ``_reduced_gammas``. The value is one
+            ``(gamma_q1_sum, gamma_q2_sum)`` tuple per grid point when a
+            single sigma and temperature are used. Only supported with
+            ``frequency_points_at_bands=True``. Default is ``False``.
         output_filename : str, optional
             Inserted into output filenames.
+        lang : str, optional
+            Backend selection. ``"C"``, ``"Python"``, ``"Rust"``, ``"GPU"``,
+            ``"GPU_phase"``, and ``"Hybrid"`` are accepted. Default is ``"C"``.
 
         Returns
         -------
@@ -2154,20 +2177,31 @@ class Phono3py:
             scattering_event_class=scattering_event_class,
             write_gamma_detail=write_gamma_detail,
             return_gamma_detail=keep_gamma_detail,
+            return_reduced_gamma_detail=keep_reduced_gamma_detail,
             output_filename=output_filename,
             log_level=self._log_level,
-            lang=self._lang,
+            lang=lang,
         )
-        if keep_gamma_detail:
+        if keep_reduced_gamma_detail:
+            self._frequency_points, self._gammas, self._reduced_gammas = vals
+            self._ise_params = ImagSelfEnergyValues(
+                frequency_points=self._frequency_points,
+                gammas=self._gammas,
+                scattering_event_class=scattering_event_class,
+            )
+        elif keep_gamma_detail:
+            self._frequency_points, self._gammas, self._detailed_gammas = vals
+            self._ise_params = ImagSelfEnergyValues(
+                frequency_points=self._frequency_points,
+                gammas=self._gammas,
+                scattering_event_class=scattering_event_class,
+                detailed_gammas=self._detailed_gammas,
+            )
+        else:
             self._ise_params = ImagSelfEnergyValues(
                 frequency_points=vals[0],
                 gammas=vals[1],
                 scattering_event_class=scattering_event_class,
-                detailed_gammas=vals[2],
-            )
-        else:
-            self._ise_params = ImagSelfEnergyValues(
-                frequency_points=vals[0], gammas=vals[1]
             )
 
         if write_txt:

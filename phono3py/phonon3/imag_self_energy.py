@@ -52,7 +52,7 @@ from phono3py.file_IO import (
     write_imag_self_energy_at_grid_point,
 )
 from phono3py.phonon.func import bose_einstein
-from phono3py.phonon3.interaction import Interaction
+from phono3py.phonon3.interaction_fast import Interaction
 from phono3py.phonon3.triplets import get_triplets_integration_weights
 
 
@@ -149,7 +149,7 @@ class ImagSelfEnergy:
         self,
         interaction: Interaction,
         with_detail: bool = False,
-        lang: Literal["C", "Python", "Rust"] = "Rust",
+        lang: Literal["C", "Python", "Rust", "GPU", "GPU_phase", "Hybrid"] = "Rust",
     ) -> None:
         """Init method.
 
@@ -179,11 +179,14 @@ class ImagSelfEnergy:
 
         if lang in ("C", "Rust"):
             lang = resolve_lang(lang)
-        self._lang: Literal["C", "Python", "Rust"] = lang
+        self._lang: Literal[
+            "C", "Python", "Rust", "GPU", "GPU_phase", "Hybrid"
+        ] = lang
         log_dispatch(lang, "ImagSelfEnergy.__init__")
         self._imag_self_energy: NDArray[np.double] | None = None
         self._detailed_imag_self_energy: NDArray[np.double] | None = None
         self._pp_strength: NDArray[np.double] | None = None
+        self._pp_strength_gpu: NDArray[np.double] | None = None
         self._frequencies: NDArray[np.double] | None = None
         self._triplets_at_q: NDArray[np.int64] | None = None
         self._weights_at_q: NDArray[np.int64] | None = None
@@ -239,10 +242,12 @@ class ImagSelfEnergy:
     def run_interaction(self, is_full_pp: bool = True) -> None:
         """Calculate ph-ph interaction."""
         if is_full_pp or self._frequency_points is not None:
-            self._pp.run()
+            self._pp.run(lang=self._lang)
         else:
-            self._pp.run(g_zero=self._g_zero)
+            self._pp.run(lang=self._lang, g_zero=self._g_zero)
         self._pp_strength = self._pp.interaction_strength
+        # Also get GPU array if available (for efficient GPU ISE calculation)
+        self._pp_strength_gpu = getattr(self._pp, "interaction_strength_gpu", None)
 
     def run_integration_weights(
         self, scattering_event_class: Literal[1, 2] | None = None
@@ -264,6 +269,7 @@ class ImagSelfEnergy:
             self._sigma,
             self._sigma_cutoff,
             is_collision_matrix=isinstance(self, CollisionMatrix),
+            lang=self._lang,
         )
 
         if scattering_event_class == 1 or scattering_event_class == 2:
@@ -313,6 +319,32 @@ class ImagSelfEnergy:
         """Return triplets contributions to imaginary-part of self-energies."""
         return self._detailed_imag_self_energy
 
+    @property
+    def reduced_imag_self_energy(
+        self,
+    ) -> tuple[NDArray[np.double], NDArray[np.double]] | None:
+        """Return band-summed reduced views of the detailed self-energy.
+
+        Returns ``(gamma_q1_sum, gamma_q2_sum)`` derived from the detailed
+        (triplet-resolved) gamma without materializing the full dense tensor in
+        the caller. For the band-indices path the detailed array has shape
+        ``(triplets, band0, band1, band2)`` and the reduced views are::
+
+            gamma_q1_sum = sum(detailed, axis=band2)  -> (triplets, band0, band1)
+            gamma_q2_sum = sum(detailed, axis=band1)  -> (triplets, band0, band2)
+
+        This matches the reductions the W-assembly driver expects (see
+        ``compute_reduced_gamma`` in the GPU scattering driver). Returns None if
+        the detailed gamma was not computed (``with_detail=False``).
+        """
+        d = self._detailed_imag_self_energy
+        if d is None:
+            return None
+        # band2 is the last axis, band1 the second-to-last.
+        gamma_q1_sum = np.sum(d, axis=-1)
+        gamma_q2_sum = np.sum(d, axis=-2)
+        return gamma_q1_sum, gamma_q2_sum
+
     def get_detailed_imag_self_energy(self) -> NDArray[np.double] | None:
         """Return triplets contributions to imaginary-part of self-energies."""
         warnings.warn(
@@ -355,6 +387,7 @@ class ImagSelfEnergy:
         else:
             self._pp.set_grid_point(grid_point)
             self._pp_strength = None
+            self._pp_strength_gpu = None
             self._triplets_at_q, self._weights_at_q = self._pp.get_triplets_at_q()[:2]
             self._grid_point = grid_point
             self._frequencies, self._eigenvectors, _ = self._pp.get_phonons()
@@ -452,11 +485,13 @@ class ImagSelfEnergy:
         """Delete large ndarray's."""
         self._g = None
         self._g_zero = None
-        self._pp_strength = None
+        if self._lang != "GPU_phase":
+            self._pp_strength = None
+            self._pp_strength_gpu = None
 
     def _run_with_band_indices(self) -> None:
         if self._g is not None:
-            if self._lang == "C":
+            if self._lang == "C" or self._lang == "Fast":
                 if self._with_detail:
                     # self._detailed_imag_self_energy.shape =
                     #    (num_triplets, num_band0, num_band, num_band)
@@ -470,6 +505,8 @@ class ImagSelfEnergy:
                     self._run_rust_detailed_with_band_indices_with_g()
                 else:
                     self._run_rust_with_band_indices_with_g()
+            elif self._lang in ("GPU", "GPU_phase", "Hybrid"):
+                self._run_gpu_with_band_indices_with_g()
             else:
                 print("Running into _run_py_with_band_indices_with_g()")
                 print("This routine is super slow and only for the test.")
@@ -485,7 +522,7 @@ class ImagSelfEnergy:
 
     def _run_with_frequency_points(self) -> None:
         if self._g is not None:
-            if self._lang == "C":
+            if self._lang == "C" or self._lang == "Fast":
                 if self._with_detail:
                     self._run_c_detailed_with_frequency_points_with_g()
                 else:
@@ -497,6 +534,12 @@ class ImagSelfEnergy:
                     self._run_c_detailed_with_frequency_points_with_g()
                 else:
                     self._run_rust_with_frequency_points_with_g()
+            elif self._lang in ("GPU", "GPU_phase", "Hybrid") and self._with_detail:
+                raise NotImplementedError(
+                    "Detailed gamma with frequency-point sampling is not implemented "
+                    "for lang='GPU'/'GPU_phase'/'Hybrid'. "
+                    "Use frequency_points_at_bands=True."
+                )
             else:
                 print("Running into _run_py_with_frequency_points_with_g()")
                 print("This routine is super slow and only for the test.")
@@ -764,6 +807,257 @@ class ImagSelfEnergy:
         else:
             self._ise_thm_with_band_indices_0K()
 
+    def _run_gpu_with_band_indices_with_g(self):
+        """CuPy implementation of _ise_thm_with_band_indices.
+
+        Vectorizes the sum over triplets and bands on GPU using batched
+        processing to avoid out-of-memory errors for large systems.
+
+        If pp_strength is already on GPU (from GPU interaction calculation),
+        uses it directly to avoid CPU->GPU transfer overhead.
+        """
+        import time
+        timing = {}
+        t_total_start = time.perf_counter()
+
+        try:
+            import cupy as cp
+        except ImportError as exc:
+            raise ImportError(
+                "GPU imag_self_energy requires CuPy. "
+                "Install cupy-cudaXX or use lang='C'."
+            ) from exc
+
+        if self._pp_strength is None or self._g is None:
+            raise RuntimeError("pp_strength or integration weights are not set.")
+
+        # Check if pp_strength is already on GPU (avoids CPU->GPU transfer)
+        pp_on_gpu = self._pp_strength_gpu is not None
+
+        t_start = time.perf_counter()
+        cutoff = self._cutoff_frequency
+        triplets = self._triplets_at_q
+        weights = self._weights_at_q
+        freqs_all = self._frequencies  # (num_bz, num_band)
+
+        num_triplets = len(triplets)
+        num_band0 = self._pp_strength.shape[1]
+        num_band = self._pp_strength.shape[2]
+
+        # Estimate batch size based on available GPU memory
+        # Each triplet needs: g(2*B0*B*B) + pp(B0*B*B) + intermediates
+        # Use conservative estimate: ~10x the raw data size for intermediates
+        # If pp is already on GPU, we need less transfer bandwidth
+        detail_factor = 16 if self._with_detail else 10
+        bytes_per_triplet = 8 * (
+            2 * num_band0 * num_band * num_band
+            + num_band0 * num_band * num_band
+            + detail_factor * num_band0 * num_band * num_band
+        )
+
+        try:
+            free_mem = cp.cuda.Device().mem_info[0]  # Free memory in bytes
+            # Use at most 50% of free memory, with minimum batch size of 10
+            max_batch = max(1, int(0.6 * free_mem / bytes_per_triplet))
+        except Exception:
+            max_batch = 10  # Fallback default
+
+        batch_size = min(max_batch, num_triplets)
+        timing['setup'] = time.perf_counter() - t_start
+
+        # Pre-compute Bose-Einstein factors on CPU (cheap, avoids repeated GPU transfers)
+        t_start = time.perf_counter()
+        f2 = freqs_all[triplets[:, 1]]  # (T,B)
+        f3 = freqs_all[triplets[:, 2]]  # (T,B)
+        f_stack = np.stack((f2, f3), axis=1)  # (T,2,B)
+        f_stack = np.where(f_stack > cutoff, f_stack, 1.0)
+
+        from phono3py.phonon.func import bose_einstein
+        n_all = bose_einstein(f_stack, self._temperature)  # (T,2,B)
+
+        # Pre-compute frequency masks on CPU
+        mask2_all = f2 > cutoff  # (T,B)
+        mask3_all = f3 > cutoff  # (T,B)
+        timing['cpu_precompute'] = time.perf_counter() - t_start
+
+        # Accumulate result on GPU
+        result_gpu = cp.zeros(num_band0, dtype=cp.float64)
+
+        # Process triplets in batches
+        t_batch_start = time.perf_counter()
+        timing['batch_transfer'] = 0.0
+        timing['batch_compute'] = 0.0
+        num_batches = 0
+
+        # Print array sizes for debugging OOM
+        g_shape = self._g.shape
+        g_size_per_triplet = 2 * num_band0 * num_band * num_band * 8 / 1e9
+        print(f"  [DEBUG] g array: shape={g_shape}, size_per_triplet={g_size_per_triplet:.2f} GB")
+        print(f"  [DEBUG] batch_size={batch_size}, total g_batch size={batch_size * g_size_per_triplet:.2f} GB")
+
+        for batch_start in range(0, num_triplets, batch_size):
+            batch_end = min(batch_start + batch_size, num_triplets)
+            bs = batch_end - batch_start  # Current batch size
+            num_batches += 1
+
+            # Slice data for this batch
+            t_xfer = time.perf_counter()
+            n_batch = n_all[batch_start:batch_end]  # (bs, 2, B)
+            mask2_batch = mask2_all[batch_start:batch_end]  # (bs, B)
+            mask3_batch = mask3_all[batch_start:batch_end]  # (bs, B)
+            g_batch = self._g[:, batch_start:batch_end]  # (2, bs, B0, B, B)
+            w_batch = weights[batch_start:batch_end]  # (bs,)
+
+            # Debug: print sizes for first batch or when OOM might occur
+            if num_batches == 1:
+                free_mem, total_mem = cp.cuda.Device().mem_info
+                print(f"  [DEBUG] GPU memory: {free_mem/1e9:.2f} GB free / {total_mem/1e9:.2f} GB total")
+                print(f"  [DEBUG] First batch sizes:")
+                print(f"    - g_batch: shape={g_batch.shape}, size={g_batch.nbytes/1e9:.2f} GB")
+                print(f"    - n_batch: shape={n_batch.shape}, size={n_batch.nbytes/1e9:.2f} GB")
+                if not pp_on_gpu:
+                    pp_batch_temp = self._pp_strength[batch_start:batch_end]
+                    print(f"    - pp_batch: shape={pp_batch_temp.shape}, size={pp_batch_temp.nbytes/1e9:.2f} GB")
+
+            # Transfer batch to GPU with error handling
+            try:
+                n_cp = cp.asarray(n_batch, dtype=cp.float64)
+            except cp.cuda.memory.OutOfMemoryError as e:
+                print(f"  [OOM] Failed to allocate n_batch: shape={n_batch.shape}, size={n_batch.nbytes/1e9:.2f} GB")
+                raise
+
+            try:
+                g_cp = cp.asarray(g_batch, dtype=cp.float64)
+            except cp.cuda.memory.OutOfMemoryError as e:
+                print(f"  [OOM] Failed to allocate g_batch: shape={g_batch.shape}, size={g_batch.nbytes/1e9:.2f} GB")
+                raise
+
+            try:
+                w_cp = cp.asarray(w_batch, dtype=cp.float64)[:, None, None, None]
+            except cp.cuda.memory.OutOfMemoryError as e:
+                print(f"  [OOM] Failed to allocate w_batch: shape={w_batch.shape}, size={w_batch.nbytes/1e9:.2f} GB")
+                raise
+
+            # Get pp_strength: use GPU array directly if available (no transfer!)
+            if pp_on_gpu:
+                pp_cp = self._pp_strength_gpu[batch_start:batch_end]  # Already on GPU
+            else:
+                try:
+                    pp_batch = self._pp_strength[batch_start:batch_end]  # (bs, B0, B, B)
+                    pp_cp = cp.asarray(pp_batch, dtype=cp.float64)
+                except cp.cuda.memory.OutOfMemoryError as e:
+                    print(f"  [OOM] Failed to allocate pp_batch: shape={pp_batch.shape}, size={pp_batch.nbytes/1e9:.2f} GB")
+                    raise
+
+            # Build frequency mask on GPU
+            mask2_cp = cp.asarray(mask2_batch)
+            mask3_cp = cp.asarray(mask3_batch)
+            cp.cuda.Stream.null.synchronize()
+            timing['batch_transfer'] += time.perf_counter() - t_xfer
+
+            t_compute = time.perf_counter()
+            try:
+                freq_mask = (mask2_cp[:, None, :, None] & mask3_cp[:, None, None, :]).astype(cp.float64)
+                del mask2_cp, mask3_cp  # Free immediately
+
+                # Extract components
+                n2 = n_cp[:, 0, :]  # (bs, B)
+                n3 = n_cp[:, 1, :]  # (bs, B)
+                g0 = g_cp[0]  # (bs, B0, B, B)
+                g1 = g_cp[1]  # (bs, B0, B, B)
+                del n_cp, g_cp  # Free intermediate references
+
+                # Broadcast Bose factors: (bs, 1, B, B)
+                n2_b = n2[:, None, :, None]
+                n3_b = n3[:, None, None, :]
+                del n2, n3
+
+                # Compute contribution for this batch
+                # Use in-place operations where possible to reduce peak memory
+                term_plus = n2_b + n3_b
+                term_plus += 1.0  # in-place
+                term_minus = n2_b - n3_b
+                del n2_b, n3_b
+
+                # coeff = (term_plus * g0 + term_minus * g1) * w * freq_mask
+                coeff = term_plus * g0
+                del term_plus
+                coeff += term_minus * g1
+                del term_minus, g0, g1
+                coeff *= freq_mask
+                del freq_mask
+
+                if self._with_detail:
+                    # Keep triplet-resolved contribution for write_gamma_detail path.
+                    # This is intentionally unweighted by triplet multiplicity so that
+                    # readers can apply `weight` exactly as done in CPU workflows.
+                    # Shape: (batch_triplets, band0, band1, band2)
+                    detailed_batch = coeff * pp_cp
+                    weighted_batch = detailed_batch * w_cp
+                    batch_contrib = cp.sum(weighted_batch, axis=(0, 2, 3))
+                    result_gpu += batch_contrib
+                    self._detailed_imag_self_energy[batch_start:batch_end] = cp.asnumpy(
+                        detailed_batch
+                    )
+                    del detailed_batch, weighted_batch, batch_contrib, w_cp, pp_cp, coeff
+                else:
+                    # Sum over triplets and band indices: (B0,)
+                    coeff *= w_cp
+                    del w_cp
+                    coeff *= pp_cp
+                    del pp_cp
+                    batch_contrib = cp.sum(coeff, axis=(0, 2, 3))
+                    del coeff
+
+                    result_gpu += batch_contrib
+                    del batch_contrib
+            except cp.cuda.memory.OutOfMemoryError as e:
+                free_mem, total_mem = cp.cuda.Device().mem_info
+                print(f"  [OOM] Failed during compute phase!")
+                print(f"  [OOM] GPU memory: {free_mem/1e9:.2f} GB free / {total_mem/1e9:.2f} GB total")
+                print(f"  [OOM] Batch size was: {bs}, g0 shape: ({bs}, {num_band0}, {num_band}, {num_band})")
+                print(f"  [OOM] Each g0/g1 array: {bs * num_band0 * num_band * num_band * 8 / 1e9:.2f} GB")
+                print(f"  [OOM] Total for intermediate arrays (coeff, term_plus, etc): ~{4 * bs * num_band0 * num_band * num_band * 8 / 1e9:.2f} GB")
+                raise
+
+            cp.cuda.Stream.null.synchronize()
+            timing['batch_compute'] += time.perf_counter() - t_compute
+
+            # Aggressively free GPU memory between batches
+            cp.get_default_memory_pool().free_all_blocks()
+
+        timing['batch_loop_total'] = time.perf_counter() - t_batch_start
+
+        t_start = time.perf_counter()
+        imag = cp.asnumpy(result_gpu) * self._unit_conversion
+        del result_gpu
+        cp.get_default_memory_pool().free_all_blocks()
+        timing['result_transfer'] = time.perf_counter() - t_start
+
+        self._imag_self_energy[:] = imag
+        if self._with_detail:
+            self._detailed_imag_self_energy *= self._unit_conversion
+
+        timing['total'] = time.perf_counter() - t_total_start
+
+        # Print timing summary
+        pp_status = "ON GPU (no transfer)" if pp_on_gpu else "CPU->GPU transfer"
+        print(
+            f"\n[ISE GPU TIMING] _run_gpu_with_band_indices_with_g "
+            f"({num_triplets} triplets, {num_band} bands):"
+        )
+        print(f"  Batch size: {batch_size}, Num batches: {num_batches}")
+        print(f"  pp_strength: {pp_status}")
+        print(f"  with_detail: {self._with_detail}")
+        print(f"  Setup:              {timing['setup']:8.4f} s")
+        print(f"  CPU precompute:     {timing['cpu_precompute']:8.4f} s")
+        print(f"  Batch loop total:   {timing['batch_loop_total']:8.4f} s")
+        print(f"    - Transfer:       {timing['batch_transfer']:8.4f} s")
+        print(f"    - Compute:        {timing['batch_compute']:8.4f} s")
+        print(f"  Result transfer:    {timing['result_transfer']:8.4f} s")
+        print(f"  ----------------------------------------")
+        print(f"  TOTAL:              {timing['total']:8.4f} s\n", flush=True)
+
     def _ise_thm_with_band_indices(self) -> None:
         assert self._frequencies is not None
         assert self._triplets_at_q is not None
@@ -868,6 +1162,57 @@ class ImagSelfEnergy:
         )
 
 
+def get_detailed_imag_self_energy_from_g(
+    interaction: Interaction,
+    temperature: float,
+    g: np.ndarray,
+    g_zero: Optional[np.ndarray] = None,
+    pp_strength: Optional[np.ndarray] = None,
+    unit_conversion_factor: Optional[float] = None,
+) -> np.ndarray:
+    """Return unweighted per-triplet gamma_detail from integration weights.
+
+    This mirrors the formula used by ``ImagSelfEnergy`` and by
+    ``write_gamma_detail`` for frequency_points_at_bands=True:
+
+    ``((n1 + n2 + 1) * g[0] + (n1 - n2) * g[1]) * |V3|^2 * unit``.
+
+    The returned array is intentionally not multiplied by triplet weights,
+    matching the HDF5 ``gamma_detail`` convention. Callers that assemble row
+    sums or W-like matrices should apply ``interaction.get_triplets_at_q()[1]``
+    exactly once.
+    """
+    if pp_strength is None:
+        pp_strength = interaction.interaction_strength
+    if pp_strength is None:
+        raise RuntimeError("pp_strength is required; run interaction first.")
+    if g.shape[0] != 2:
+        raise ValueError(f"ISE gamma_detail requires two integration weights, got {g.shape[0]}.")
+
+    frequencies = interaction.get_phonons()[0]
+    triplets = interaction.get_triplets_at_q()[0]
+    cutoff = interaction.cutoff_frequency
+    if unit_conversion_factor is None:
+        unit_conversion_factor = ImagSelfEnergy(interaction).unit_conversion_factor
+
+    f1 = frequencies[triplets[:, 1]]
+    f2 = frequencies[triplets[:, 2]]
+    valid = (f1 > cutoff) & (f2 > cutoff)
+    safe_f1 = np.where(f1 > cutoff, f1, 1.0)
+    safe_f2 = np.where(f2 > cutoff, f2, 1.0)
+    n1 = bose_einstein(safe_f1, temperature)
+    n2 = bose_einstein(safe_f2, temperature)
+
+    coeff = (
+        (n1[:, None, :, None] + n2[:, None, None, :] + 1.0) * g[0]
+        + (n1[:, None, :, None] - n2[:, None, None, :]) * g[1]
+    )
+    coeff *= valid[:, None, :, None]
+    if g_zero is not None:
+        coeff = np.where(np.asarray(g_zero, dtype=bool), 0.0, coeff)
+    return coeff * pp_strength * float(unit_conversion_factor)
+
+
 def get_imag_self_energy(
     interaction: Interaction,
     grid_points: NDArray[np.int64] | Sequence[int],
@@ -881,10 +1226,19 @@ def get_imag_self_energy(
     scattering_event_class: Literal[1, 2] | None = None,
     write_gamma_detail: bool = False,
     return_gamma_detail: bool = False,
+    return_reduced_gamma_detail: bool = False,
     output_filename: str | None = None,
     log_level: int = 0,
-    lang: Literal["C", "Python", "Rust"] = "Rust",
-) -> tuple[NDArray[np.double] | None, NDArray[np.double], list[NDArray[np.double]]]:
+    lang: Literal["C", "Python", "Rust", "GPU", "GPU_phase", "Hybrid"] = "Rust",
+) -> (
+    tuple[NDArray[np.double] | None, NDArray[np.double]]
+    | tuple[
+        NDArray[np.double] | None,
+        NDArray[np.double],
+        list[NDArray[np.double]]
+        | list[tuple[NDArray[np.double], NDArray[np.double]]],
+    ]
+):
     """Imaginary-part of self-energy at frequency points.
 
     Band indices to be calculated at are found in Interaction instance.
@@ -937,7 +1291,8 @@ def get_imag_self_energy(
         With True, detailed gammas are returned. Default is False.
     log_level: int
         Log level. Default is 0.
-
+    lang: str, optional
+        Language to use for the calculation. Default is "C".
     Returns
     -------
     tuple :
@@ -1014,10 +1369,14 @@ def get_imag_self_energy(
         )
 
     detailed_gamma: list[NDArray[np.double]] = []
+    reduced_gamma: list[
+        tuple[NDArray[np.double], NDArray[np.double]]
+        | list[tuple[NDArray[np.double], NDArray[np.double]]]
+    ] = []
 
     ise = ImagSelfEnergy(
         interaction,
-        with_detail=(write_gamma_detail or return_gamma_detail),
+        with_detail=(write_gamma_detail or return_gamma_detail or return_reduced_gamma_detail),
         lang=lang,
     )
     for i, gp in enumerate(grid_points):
@@ -1039,7 +1398,6 @@ def get_imag_self_energy(
                 )
             print("Grid point: %d" % gp)
             print("Number of ir-triplets: %d / %d" % (len(weights), weights.sum()))
-
         ise.run_interaction()
         frequencies = interaction.get_phonons()[0][gp]  # type: ignore[index]
 
@@ -1053,6 +1411,7 @@ def get_imag_self_energy(
         _get_imag_self_energy_at_gp(
             gamma,
             detailed_gamma,
+            reduced_gamma,
             i,
             gp,
             _sigmas,
@@ -1065,16 +1424,25 @@ def get_imag_self_energy(
             ise,
             write_gamma_detail,
             return_gamma_detail,
+            return_reduced_gamma_detail,
             output_filename,
             log_level,
         )
 
-    return _frequency_points, gamma, detailed_gamma
+    if return_reduced_gamma_detail:
+        return _frequency_points, gamma, reduced_gamma
+    if return_gamma_detail:
+        return _frequency_points, gamma, detailed_gamma
+    return _frequency_points, gamma
 
 
 def _get_imag_self_energy_at_gp(
     gamma: NDArray[np.double],
     detailed_gamma: list[NDArray[np.double]],
+    reduced_gamma: list[
+        tuple[NDArray[np.double], NDArray[np.double]]
+        | list[tuple[NDArray[np.double], NDArray[np.double]]]
+    ],
     i: int,
     gp: int,
     sigmas: Sequence[float | None],
@@ -1087,9 +1455,15 @@ def _get_imag_self_energy_at_gp(
     ise: ImagSelfEnergy,
     write_gamma_detail: bool,
     return_gamma_detail: bool,
+    return_reduced_gamma_detail: bool,
     output_filename: str | None,
     log_level: int,
 ) -> None:
+    if return_reduced_gamma_detail and frequency_points is not None:
+        raise NotImplementedError(
+            "return_reduced_gamma_detail is only supported with "
+            "frequency_points_at_bands=True (band-indices mode)."
+        )
     num_band0 = len(interaction.band_indices)
     frequencies = interaction.get_phonons()[0]
     assert frequencies is not None
@@ -1128,6 +1502,10 @@ def _get_imag_self_energy_at_gp(
     else:
         detailed_gamma_at_gp = None
 
+    reduced_gamma_at_gp: (
+        list[tuple[NDArray[np.double], NDArray[np.double]]] | None
+    ) = [] if return_reduced_gamma_detail else None
+
     for j, sigma in enumerate(sigmas):
         if log_level:
             if sigma:
@@ -1139,6 +1517,7 @@ def _get_imag_self_energy_at_gp(
         _get_imag_self_energy_at_sigma(
             gamma,
             detailed_gamma_at_gp,
+            reduced_gamma_at_gp,
             i,
             j,
             temperatures,
@@ -1148,6 +1527,7 @@ def _get_imag_self_energy_at_gp(
             ise,
             write_gamma_detail,
             return_gamma_detail,
+            return_reduced_gamma_detail,
             log_level,
         )
 
@@ -1175,10 +1555,22 @@ def _get_imag_self_energy_at_gp(
         if return_gamma_detail:
             detailed_gamma.append(detailed_gamma_at_gp)
 
+    if return_reduced_gamma_detail:
+        assert reduced_gamma_at_gp is not None
+        # The driver uses a single sigma and a single temperature, in which case
+        # reduced_gamma_at_gp holds exactly one (gamma_q1_sum, gamma_q2_sum)
+        # tuple; expose that tuple directly. For multiple (sigma, temperature)
+        # combinations, keep the full list of tuples.
+        if len(reduced_gamma_at_gp) == 1:
+            reduced_gamma.append(reduced_gamma_at_gp[0])
+        else:
+            reduced_gamma.append(reduced_gamma_at_gp)
+
 
 def _get_imag_self_energy_at_sigma(
     gamma: NDArray[np.double],
     detailed_gamma_at_gp: NDArray[np.double] | None,
+    reduced_gamma_at_gp: list[tuple[NDArray[np.double], NDArray[np.double]]] | None,
     i: int,
     j: int,
     temperatures: NDArray[np.double],
@@ -1188,6 +1580,7 @@ def _get_imag_self_energy_at_sigma(
     ise: ImagSelfEnergy,
     write_gamma_detail: bool,
     return_gamma_detail: bool,
+    return_reduced_gamma_detail: bool,
     log_level: int,
 ) -> None:
     # Run one by one at frequency points
@@ -1203,8 +1596,18 @@ def _get_imag_self_energy_at_sigma(
             ise.run()
             gamma[j, k, i] = ise.imag_self_energy
             if write_gamma_detail or return_gamma_detail:
-                assert detailed_gamma_at_gp is not None
-                detailed_gamma_at_gp[k] = ise.detailed_imag_self_energy
+                assert detailed_gamma_at_gp_at_j is not None
+                detailed_gamma_at_gp_at_j[k] = ise.detailed_imag_self_energy
+            if return_reduced_gamma_detail:
+                # Reduce immediately and keep only the band-summed views, so the
+                # full per-(sigma, temperature) detailed gamma is never retained.
+                reduced_ise = ise.reduced_imag_self_energy
+                assert reduced_ise is not None
+                assert reduced_gamma_at_gp is not None
+                q1, q2 = reduced_ise
+                reduced_gamma_at_gp.append(
+                    (np.array(q1, copy=True), np.array(q2, copy=True))
+                )
     else:
         run_ise_at_frequency_points_batch(
             i,

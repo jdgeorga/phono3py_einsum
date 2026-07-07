@@ -10,11 +10,11 @@ import pytest
 from phonopy.structure.cells import get_smallest_vectors
 
 from phono3py import Phono3py
-from phono3py.phonon3.interaction import Interaction
+from phono3py.phonon3.interaction_fast import Interaction
 
 
-@pytest.mark.parametrize("lang", ["C", "Python"])
-def test_interaction_RTA_si(si_pbesol: Phono3py, lang: Literal["C", "Python"]):
+@pytest.mark.parametrize("lang", ["C", "Fast"])
+def test_interaction_RTA_si(si_pbesol: Phono3py, lang: Literal["C", "Fast"]):
     """Test interaction_strength of Si."""
     # Both C and Python paths reach the C ``imag_self_energy`` /
     # ``triplets_integration_weights`` kernels.

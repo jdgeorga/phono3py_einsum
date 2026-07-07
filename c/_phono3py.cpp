@@ -6,6 +6,48 @@
 
 #include "phono3py.h"
 #include "phonoc_array.h"
+#include "lapack_wrapper.h"
+
+// Forward declare AtomTriplets structure (matches real_to_reciprocal.h)
+typedef struct {
+    const double (*svecs)[3];
+    int64_t multi_dims[2];
+    const int64_t (*multiplicity)[2];
+    const int64_t *p2s_map;
+    const int64_t *s2p_map;
+    int64_t make_r0_average;
+    const char *all_shortest;
+    const char *nonzero_indices;  // for compact fc3
+} AtomTriplets;
+
+// Forward declarations with C linkage
+extern "C" {
+    void reciprocal_to_normal_squared(
+        double *fc3_normal_squared, const int64_t (*g_pos)[4],
+        const int64_t num_g_pos, const lapack_complex_double *fc3_reciprocal,
+        const double *freqs0, const double *freqs1, const double *freqs2,
+        const lapack_complex_double *eigvecs0,
+        const lapack_complex_double *eigvecs1,
+        const lapack_complex_double *eigvecs2, const double *masses,
+        const int64_t *band_indices, const int64_t num_band0,
+        const int64_t num_band, const double cutoff_frequency,
+        const int64_t openmp_per_triplets);
+    
+    void r2r_real_to_reciprocal(
+        lapack_complex_double *fc3_reciprocal,
+        const double q_vecs[3][3],
+        const double *fc3,
+        const int64_t is_compact_fc3,
+        const AtomTriplets *atom_triplets,
+        const int64_t openmp_per_triplets);
+    
+    /* Capture functions */
+    void itr_enable_fc3_reciprocal_capture(void);
+    void itr_disable_fc3_reciprocal_capture(void);
+    int64_t itr_get_captured_fc3_reciprocal(lapack_complex_double *fc3_reciprocal_out, 
+                                            double *q_vecs_out, int64_t max_size);
+    void itr_clear_captured_fc3_reciprocal(void);
+}
 
 namespace nb = nanobind;
 
@@ -51,7 +93,7 @@ static Darray *convert_to_darray(nb::ndarray<> npyary) {
 // }
 
 void py_get_interaction(
-    nb::ndarray<> py_fc3_normal_squared, nb::ndarray<> py_g_zero,
+    nb::ndarray<> py_fc3_normal_squared, nb::ndarray<> py_fc3_reciprocal, nb::ndarray<> py_g_zero,
     nb::ndarray<> py_frequencies, nb::ndarray<> py_eigenvectors,
     nb::ndarray<> py_triplets, nb::ndarray<> py_bz_grid_addresses,
     nb::ndarray<> py_D_diag, nb::ndarray<> py_Q, nb::ndarray<> py_fc3,
@@ -66,6 +108,7 @@ void py_get_interaction(
     _lapack_complex_double *eigvecs;
     int64_t (*triplets)[3];
     int64_t num_triplets;
+    lapack_complex_double *fc3_reciprocal;
     char *g_zero;
     int64_t (*bz_grid_addresses)[3];
     int64_t *D_diag;
@@ -84,6 +127,7 @@ void py_get_interaction(
     int64_t is_compact_fc3;
 
     fc3_normal_squared = convert_to_darray(py_fc3_normal_squared);
+    fc3_reciprocal = (lapack_complex_double *)py_fc3_reciprocal.data();
     freqs = convert_to_darray(py_frequencies);
     /* npy_cdouble and lapack_complex_double may not be compatible. */
     /* So eigenvectors should not be used in Python side */
@@ -112,7 +156,7 @@ void py_get_interaction(
     band_indices = (int64_t *)py_band_indices.data();
     all_shortest = (char *)py_all_shortest.data();
 
-    ph3py_get_interaction(fc3_normal_squared, g_zero, freqs, eigvecs, triplets,
+    ph3py_get_interaction(fc3_normal_squared, (const _lapack_complex_double*)fc3_reciprocal, g_zero, freqs, eigvecs, triplets,
                           num_triplets, bz_grid_addresses, D_diag, Q, fc3,
                           fc3_nonzero_indices, is_compact_fc3, svecs,
                           multi_dims, multi, masses, p2s, s2p, band_indices,
@@ -1004,6 +1048,227 @@ int64_t py_lapacke_pinv(nb::ndarray<> data_out_py, nb::ndarray<> data_in_py,
 }
 #endif
 
+void py_reciprocal_to_normal_squared(
+    nb::ndarray<> py_fc3_normal_squared,
+    nb::ndarray<> py_fc3_reciprocal,
+    nb::ndarray<> py_frequencies,
+    nb::ndarray<> py_eigenvectors, 
+    nb::ndarray<> py_masses,
+    nb::ndarray<> py_band_indices,
+    int64_t grid_triplet_0,
+    int64_t grid_triplet_1, 
+    int64_t grid_triplet_2,
+    double cutoff_frequency,
+    int64_t openmp_per_triplets) {
+    
+    double *fc3_normal_squared;
+    lapack_complex_double *fc3_reciprocal;
+    double *frequencies;
+    lapack_complex_double *eigenvectors;
+    double *masses;
+    int64_t *band_indices;
+    int64_t num_band, num_band0, num_atom;
+    int64_t num_g_pos;
+    int64_t (*g_pos)[4];
+    double *freqs0, *freqs1, *freqs2;
+    lapack_complex_double *eigvecs0, *eigvecs1, *eigvecs2;
+    int64_t i, j, k, idx;
+    
+    /* Extract data from numpy arrays */
+    fc3_normal_squared = (double *)py_fc3_normal_squared.data();
+    fc3_reciprocal = (lapack_complex_double *)py_fc3_reciprocal.data();
+    frequencies = (double *)py_frequencies.data();
+    eigenvectors = (lapack_complex_double *)py_eigenvectors.data();
+    masses = (double *)py_masses.data();
+    band_indices = (int64_t *)py_band_indices.data();
+    
+    /* Get dimensions */
+    num_band0 = (int64_t)py_band_indices.shape(0);
+    num_band = (int64_t)py_frequencies.shape(1);
+    num_atom = num_band / 3;
+    
+    /* Set up frequency and eigenvector pointers for the triplet */
+    freqs0 = frequencies + grid_triplet_0 * num_band;
+    freqs1 = frequencies + grid_triplet_1 * num_band;  
+    freqs2 = frequencies + grid_triplet_2 * num_band;
+    
+    eigvecs0 = eigenvectors + grid_triplet_0 * num_band * num_band;
+    eigvecs1 = eigenvectors + grid_triplet_1 * num_band * num_band;
+    eigvecs2 = eigenvectors + grid_triplet_2 * num_band * num_band;
+    
+    /* Create g_pos array for all band combinations */
+    num_g_pos = num_band0 * num_band * num_band;
+    g_pos = (int64_t (*)[4])malloc(sizeof(int64_t) * num_g_pos * 4);
+    
+    idx = 0;
+    for (i = 0; i < num_band0; i++) {
+        for (j = 0; j < num_band; j++) {
+            for (k = 0; k < num_band; k++) {
+                g_pos[idx][0] = i;    /* band index 0 (from band_indices) */
+                g_pos[idx][1] = j;    /* band index 1 */
+                g_pos[idx][2] = k;    /* band index 2 */
+                g_pos[idx][3] = idx;  /* output index */
+                idx++;
+            }
+        }
+    }
+    
+    /* Call the actual C function */
+    reciprocal_to_normal_squared(
+        fc3_normal_squared, g_pos, num_g_pos, fc3_reciprocal,
+        freqs0, freqs1, freqs2, eigvecs0, eigvecs1, eigvecs2,
+        masses, band_indices, num_band0, num_band, 
+        cutoff_frequency, openmp_per_triplets);
+    
+    /* Clean up */
+    free(g_pos);
+}
+
+void py_real_to_reciprocal(
+    nb::ndarray<> py_fc3_reciprocal,
+    nb::ndarray<> py_q_vecs,
+    nb::ndarray<> py_fc3,
+    int64_t is_compact_fc3,
+    nb::ndarray<> py_svecs,
+    nb::ndarray<> py_multi,
+    nb::ndarray<> py_p2s_map,
+    nb::ndarray<> py_s2p_map,
+    int64_t make_r0_average,
+    nb::ndarray<> py_all_shortest,
+    nb::ndarray<> py_fc3_nonzero_indices,
+    int64_t openmp_per_triplets) {
+    
+    lapack_complex_double *fc3_reciprocal;
+    double q_vecs_array[3][3];  /* Use stack-allocated array for q_vecs */
+    double *fc3;
+    const double (*svecs)[3];
+    const int64_t (*multi)[2];
+    const int64_t *p2s_map;
+    const int64_t *s2p_map;
+    const char *all_shortest;
+    const char *fc3_nonzero_indices;
+    AtomTriplets *atom_triplets;
+    int64_t multi_dims[2];
+    int64_t i, j;
+    double *q_vecs_ptr;
+    
+    /* Validate array shapes */
+    if (py_q_vecs.shape(0) != 3 || py_q_vecs.shape(1) != 3) {
+        return; /* Invalid q_vecs shape */
+    }
+    
+    /* Extract data from numpy arrays */
+    fc3_reciprocal = (lapack_complex_double *)py_fc3_reciprocal.data();
+    q_vecs_ptr = (double *)py_q_vecs.data();
+    fc3 = (double *)py_fc3.data();
+    svecs = (const double (*)[3])py_svecs.data();
+    multi = (const int64_t (*)[2])py_multi.data();
+    p2s_map = (const int64_t *)py_p2s_map.data();
+    s2p_map = (const int64_t *)py_s2p_map.data();
+    all_shortest = (const char *)py_all_shortest.data();
+    fc3_nonzero_indices = (const char *)py_fc3_nonzero_indices.data();
+    
+    /* Copy q_vecs to ensure proper memory layout */
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            q_vecs_array[i][j] = q_vecs_ptr[i * 3 + j];
+        }
+    }
+    
+    /* Get dimensions directly from multi array shape - same as working py_get_interaction */
+    for (i = 0; i < 2; i++) {
+        multi_dims[i] = py_multi.shape(i);
+    }
+    
+    /* Set up AtomTriplets structure */
+    if ((atom_triplets = (AtomTriplets *)malloc(sizeof(AtomTriplets))) == NULL) {
+        return;
+    }
+    atom_triplets->svecs = svecs;
+    atom_triplets->multi_dims[0] = multi_dims[0];
+    atom_triplets->multi_dims[1] = multi_dims[1];
+    atom_triplets->multiplicity = multi;
+    atom_triplets->p2s_map = p2s_map;
+    atom_triplets->s2p_map = s2p_map;
+    atom_triplets->make_r0_average = make_r0_average;
+    atom_triplets->all_shortest = all_shortest;
+    atom_triplets->nonzero_indices = fc3_nonzero_indices;
+    
+    /* Call the actual C function with stack-allocated q_vecs */
+    r2r_real_to_reciprocal(fc3_reciprocal, q_vecs_array, fc3, is_compact_fc3,
+                           atom_triplets, openmp_per_triplets);
+    
+    /* Clean up */
+    free(atom_triplets);
+    atom_triplets = NULL;
+}
+
+/* Python bindings for fc3_reciprocal capture functions */
+void py_enable_fc3_reciprocal_capture() {
+    itr_enable_fc3_reciprocal_capture();
+}
+
+void py_disable_fc3_reciprocal_capture() {
+    itr_disable_fc3_reciprocal_capture();
+}
+
+void py_clear_captured_fc3_reciprocal() {
+    itr_clear_captured_fc3_reciprocal();
+}
+
+int64_t py_get_captured_fc3_reciprocal(nb::ndarray<> py_fc3_reciprocal, 
+                                       nb::ndarray<> py_q_vecs) {
+    /* Debug: Print array information */
+    // printf("DEBUG CAPTURE: py_get_captured_fc3_reciprocal() called\n");
+    // printf("DEBUG CAPTURE: fc3_reciprocal.size() = %ld\n", (int64_t)py_fc3_reciprocal.size());
+    // printf("DEBUG CAPTURE: fc3_reciprocal.ndim() = %ld\n", (int64_t)py_fc3_reciprocal.ndim());
+    // if (py_fc3_reciprocal.ndim() >= 1) {
+    //     printf("DEBUG CAPTURE: fc3_reciprocal.shape(0) = %ld\n", (int64_t)py_fc3_reciprocal.shape(0));
+    // }
+    // if (py_fc3_reciprocal.ndim() >= 3) {
+    //     printf("DEBUG CAPTURE: fc3_reciprocal shape = [%ld, %ld, %ld]\n", 
+    //            (int64_t)py_fc3_reciprocal.shape(0), 
+    //            (int64_t)py_fc3_reciprocal.shape(1), 
+    //            (int64_t)py_fc3_reciprocal.shape(2));
+    // // }
+    // printf("DEBUG CAPTURE: q_vecs.size() = %ld\n", (int64_t)py_q_vecs.size());
+    // fflush(stdout);
+    
+    /* Get the captured data size */
+    int64_t size = itr_get_captured_fc3_reciprocal(NULL, NULL, 0);
+    
+    // printf("DEBUG CAPTURE: First call returned size = %ld\n", size);
+    // fflush(stdout);
+    
+    // if (size <= 0) {
+    //     printf("DEBUG CAPTURE: size <= 0, returning 0\n");
+    //     fflush(stdout);
+    //     return 0;  /* No data captured */
+    // }
+    
+    /* Check if output arrays are large enough */
+    int64_t fc3_size = py_fc3_reciprocal.size();
+    int64_t q_size = py_q_vecs.size();
+    // printf("DEBUG CAPTURE: Comparing sizes: fc3_size=%ld, q_size=%ld, captured_size=%ld\n", 
+    //        fc3_size, q_size, size);
+    // fflush(stdout);
+    
+    // if (fc3_size < size || q_size < 9) {
+    //     printf("DEBUG CAPTURE: Output arrays too small: fc3_size=%ld < size=%ld OR q_size=%ld < 9\n", 
+    //            fc3_size, size, q_size);
+    //     fflush(stdout);
+    //     return -1;  /* Output arrays too small */
+    // }
+    
+    /* Get the data */
+    int64_t actual_size = itr_get_captured_fc3_reciprocal(
+        (lapack_complex_double *)py_fc3_reciprocal.data(),
+        (double *)py_q_vecs.data(),
+        fc3_size);  /* Use actual buffer size, not data size */
+    
+    return actual_size;
+}
+
 NB_MODULE(_phono3py, m) {
     m.def("interaction", &py_get_interaction);
     m.def("pp_collision", &py_get_pp_collision);
@@ -1040,6 +1305,12 @@ NB_MODULE(_phono3py, m) {
     m.def("default_colmat_solver", &py_get_default_colmat_solver);
     m.def("omp_max_threads", &py_get_omp_max_threads);
     m.def("include_lapacke", &py_include_lapacke);
+    m.def("reciprocal_to_normal_squared", &py_reciprocal_to_normal_squared);
+    m.def("real_to_reciprocal", &py_real_to_reciprocal);
+    m.def("enable_fc3_reciprocal_capture", &py_enable_fc3_reciprocal_capture);
+    m.def("disable_fc3_reciprocal_capture", &py_disable_fc3_reciprocal_capture);
+    m.def("clear_captured_fc3_reciprocal", &py_clear_captured_fc3_reciprocal);
+    m.def("get_captured_fc3_reciprocal", &py_get_captured_fc3_reciprocal);
 #ifndef NO_INCLUDE_LAPACKE
     m.def("diagonalize_collision_matrix", &py_diagonalize_collision_matrix);
     m.def("pinv_from_eigensolution", &py_pinv_from_eigensolution);

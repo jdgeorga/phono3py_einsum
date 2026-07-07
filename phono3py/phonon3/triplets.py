@@ -191,6 +191,15 @@ def get_triplets_integration_weights(
         shape=(triplets, freq_points, bands, bands), dtype='byte'
 
     """
+    if lang in ("GPU", "GPU_phase") and sigma is not None:
+        print(
+            "GPU backend currently supports only tetrahedron (sigma=None) "
+            "for triplets integration weights."
+        )
+        raise RuntimeError(
+            f"Sigma-based smearing is not implemented for lang='{lang}'. "
+            "Use sigma=None (tetrahedron) or lang='C'."
+        )
     if lang in ("C", "Rust"):
         lang = resolve_lang(lang)
 
@@ -216,7 +225,7 @@ def get_triplets_integration_weights(
     g[:] = 0
 
     if sigma:
-        if lang in ("C", "Rust"):
+        if lang in ("C", "Rust", "GPU", "GPU_phase"):
             g_zero = np.zeros(g.shape[1:], dtype="byte", order="C")
             cutoff: float
             if sigma_cutoff is None:
@@ -251,7 +260,7 @@ def get_triplets_integration_weights(
                     if len(g) == 3:
                         g[2, i, :, j, k] = g0 + g1 + g2
     else:
-        if lang in ("C", "Rust"):
+        if lang in ("C", "Rust", "GPU", "GPU_phase"):
             g_zero = np.zeros(g.shape[1:], dtype="byte", order="C")
             if lang == "Rust":
                 _set_triplets_integration_weights_rust(

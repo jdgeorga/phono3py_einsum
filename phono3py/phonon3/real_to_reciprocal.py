@@ -102,6 +102,7 @@ class RealToReciprocal:
         self._triplet = triplet
         num_patom = len(self._primitive)
         dtype = "c%d" % (np.dtype("double").itemsize * 2)
+            
         self._fc3_reciprocal = np.zeros(
             (num_patom, num_patom, num_patom, 3, 3, 3), dtype=dtype
         )
@@ -129,7 +130,6 @@ class RealToReciprocal:
                         q_indices=(1, 2),
                         leg_index=0,
                     )
-
             prephase = self._get_prephase(sum_q, i)
             self._fc3_reciprocal[i] *= prephase
 

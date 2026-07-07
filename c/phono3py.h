@@ -49,7 +49,7 @@ typedef struct {
 } _lapack_complex_double;
 
 int64_t ph3py_get_interaction(
-    Darray *fc3_normal_squared, const char *g_zero, const Darray *frequencies,
+    Darray *fc3_normal_squared, const _lapack_complex_double *fc3_reciprocal, const char *g_zero, const Darray *frequencies,
     const _lapack_complex_double *eigenvectors, const int64_t (*triplets)[3],
     const int64_t num_triplets, const int64_t (*bz_grid_addresses)[3],
     const int64_t D_diag[3], const int64_t Q[3][3], const double *fc3,

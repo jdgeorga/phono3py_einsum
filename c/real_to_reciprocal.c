@@ -81,19 +81,67 @@ void r2r_real_to_reciprocal(lapack_complex_double *fc3_reciprocal,
                             const int64_t is_compact_fc3,
                             const AtomTriplets *atom_triplets,
                             const int64_t openmp_per_triplets) {
+    // printf("DEBUG r2r: Function entry - starting r2r_real_to_reciprocal\n");
+    // fflush(stdout);
+    
     int64_t i, j, num_band, num_patom, num_satom, adrs_vec;
     lapack_complex_double *pre_phase_factors, *phase_factors, *phase_factor0,
         *phase_factor1, *phase_factor2;
 
+    // printf("DEBUG r2r: Checking input pointers\n");
+    // fflush(stdout);
+    if (!fc3_reciprocal) {
+        printf("DEBUG r2r: ERROR - fc3_reciprocal is NULL\n");
+        return;
+    }
+    if (!fc3) {
+        printf("DEBUG r2r: ERROR - fc3 is NULL\n");
+        return;
+    }
+    if (!atom_triplets) {
+        printf("DEBUG r2r: ERROR - atom_triplets is NULL\n");
+        return;
+    }
+    
+    // printf("DEBUG r2r: Extracting dimensions from atom_triplets\n");
+    // fflush(stdout);
     num_patom = atom_triplets->multi_dims[1];
     num_satom = atom_triplets->multi_dims[0];
+    
+    // printf("DEBUG r2r: num_patom=%ld, num_satom=%ld, is_compact_fc3=%ld, make_r0_average=%ld\n", 
+    //        num_patom, num_satom, is_compact_fc3, atom_triplets->make_r0_average);
+    // fflush(stdout);
 
+    // for (i = 0; i < 382; i++) {
+    //     printf("DEBUG r2r: multiplicity[%ld] = %ld, %ld\n", i, 
+    //            atom_triplets->multiplicity[i][0], 
+    //            atom_triplets->multiplicity[i][1]);
+    //     fflush(stdout);
+    // }
+
+    // printf("DEBUG r2r: Allocating pre_phase_factors array\n");
+    // fflush(stdout);
     pre_phase_factors = (lapack_complex_double *)malloc(
         sizeof(lapack_complex_double) * num_patom);
+    // if (!pre_phase_factors) {
+    //     printf("DEBUG r2r: ERROR - Failed to allocate pre_phase_factors\n");
+    //     return;
+    // }
+    
+    // printf("DEBUG r2r: Computing pre_phase_factors loop\n");
+    // fflush(stdout);
     for (i = 0; i < num_patom; i++) {
+        // printf("DEBUG r2r: Computing pre_phase_factor for i=%ld\n", i);
+        // fflush(stdout);
         pre_phase_factors[i] = get_pre_phase_factor(i, q_vecs, atom_triplets);
+        // printf("DEBUG r2r: pre_phase_factors[%ld] = %f + %fi\n", i, lapack_complex_double_real(pre_phase_factors[i]), lapack_complex_double_imag(pre_phase_factors[i]));
+        // printf("DEBUG r2r: Completed pre_phase_factor for i=%ld\n", i);
+        // fflush(stdout);
     }
 
+    // printf("DEBUG r2r: Allocating phase_factors array (size=%ld)\n", 
+    //        3 * num_patom * num_satom);
+    // fflush(stdout);
     phase_factors = (lapack_complex_double *)malloc(
         sizeof(lapack_complex_double) * 3 * num_patom * num_satom);
     phase_factor0 = phase_factors;
@@ -114,23 +162,50 @@ void r2r_real_to_reciprocal(lapack_complex_double *fc3_reciprocal,
         }
     }
 
+    for (i = 0; i < num_patom; i++) {
+        for (j = 0; j < num_satom; j++) {
+            adrs_vec = j * atom_triplets->multi_dims[1] + i;
+            // printf("DEBUG r2r: phase_factor0[%ld] = %f + %fi\n", i * num_satom + j, lapack_complex_double_real(phase_factor0[i * num_satom + j]), lapack_complex_double_imag(phase_factor0[i * num_satom + j]));
+            // printf("DEBUG r2r: phase_factor1[%ld] = %f + %fi\n", i * num_satom + j, lapack_complex_double_real(phase_factor1[i * num_satom + j]), lapack_complex_double_imag(phase_factor1[i * num_satom + j]));
+            // printf("DEBUG r2r: phase_factor2[%ld] = %f + %fi\n", i * num_satom + j, lapack_complex_double_real(phase_factor2[i * num_satom + j]), lapack_complex_double_imag(phase_factor2[i * num_satom + j]));
+            // fflush(stdout);
+        }
+    }
+
+    // printf("DEBUG r2r: Choosing which algorithm branch\n");
+    // fflush(stdout);
     if (atom_triplets->make_r0_average) {
+        // printf("DEBUG r2r: Calling real_to_reciprocal_r0_average\n");
+        // fflush(stdout);
         real_to_reciprocal_r0_average(fc3_reciprocal, pre_phase_factors,
                                       phase_factor0, phase_factor1,
                                       phase_factor2, fc3, is_compact_fc3,
                                       atom_triplets, openmp_per_triplets);
+        // printf("DEBUG r2r: Returned from real_to_reciprocal_r0_average\n");
+        // fflush(stdout);
+        
         num_band = atom_triplets->multi_dims[1] * 3;
+        // printf("DEBUG r2r: Post-processing with num_band=%ld\n", num_band);
+        // fflush(stdout);
         for (i = 0; i < num_band * num_band * num_band; i++) {
             fc3_reciprocal[i] = lapack_make_complex_double(
                 lapack_complex_double_real(fc3_reciprocal[i]) / 3,
                 lapack_complex_double_imag(fc3_reciprocal[i]) / 3);
         }
+        // printf("DEBUG r2r: Completed post-processing\n");
+        // fflush(stdout);
     } else {
+        // printf("DEBUG r2r: Calling real_to_reciprocal_legacy\n");
+        // fflush(stdout);
         real_to_reciprocal_legacy(
             fc3_reciprocal, pre_phase_factors, phase_factor1, phase_factor2,
             fc3, is_compact_fc3, atom_triplets, openmp_per_triplets);
+        // printf("DEBUG r2r: Returned from real_to_reciprocal_legacy\n");
+        // fflush(stdout);
     }
 
+    // printf("DEBUG r2r: Freeing allocated memory\n");
+    // fflush(stdout);
     free(pre_phase_factors);
     pre_phase_factors = NULL;
     free(phase_factors);
@@ -138,6 +213,9 @@ void r2r_real_to_reciprocal(lapack_complex_double *fc3_reciprocal,
     phase_factor0 = NULL;
     phase_factor1 = NULL;
     phase_factor2 = NULL;
+    
+    // printf("DEBUG r2r: Function exit - completed r2r_real_to_reciprocal\n");
+    // fflush(stdout);
 }
 
 static void real_to_reciprocal_legacy(
@@ -341,21 +419,43 @@ static void real_to_reciprocal_elements(
 static lapack_complex_double get_pre_phase_factor(
     const int64_t i_patom, const double q_vecs[3][3],
     const AtomTriplets *atom_triplets) {
+    // printf("DEBUG get_pre_phase: Entry for i_patom=%ld\n", i_patom);
+    // fflush(stdout);
     int64_t j, svecs_adrs;
     double pre_phase;
     lapack_complex_double pre_phase_factor;
 
+    // printf("DEBUG get_pre_phase: Checking p2s_map access\n");
+    // fflush(stdout);
+    if (!atom_triplets->p2s_map) {
+        // printf("DEBUG get_pre_phase: ERROR - p2s_map is NULL\n");
+        return lapack_make_complex_double(0.0, 0.0);
+    }
+    
     svecs_adrs = atom_triplets->p2s_map[i_patom] * atom_triplets->multi_dims[1];
+    // printf("DEBUG get_pre_phase: svecs_adrs=%ld, p2s_map[%ld]=%ld\n", 
+    //        svecs_adrs, i_patom, atom_triplets->p2s_map[i_patom]);
+    // fflush(stdout);
     pre_phase = 0;
     for (j = 0; j < 3; j++) {
+        double q_sum = q_vecs[0][j] + q_vecs[1][j] + q_vecs[2][j];
+        // printf("DEBUG get_pre_phase: j=%ld, multiplicity[%ld][1]=%ld, svecs[%ld][%ld]=%f, q_sum=%f\n", 
+        //        j, svecs_adrs, atom_triplets->multiplicity[svecs_adrs][1],atom_triplets
+        //         ->svecs[atom_triplets->multiplicity[svecs_adrs][1]][j] , q_sum);
+        // fflush(stdout);
+        
         pre_phase +=
             atom_triplets
                 ->svecs[atom_triplets->multiplicity[svecs_adrs][1]][j] *
             (q_vecs[0][j] + q_vecs[1][j] + q_vecs[2][j]);
+        // printf("DEBUG get_pre_phase: j=%ld completed, pre_phase=%f\n", j, pre_phase);
+        // fflush(stdout);
     }
     pre_phase *= M_2PI;
     pre_phase_factor =
         lapack_make_complex_double(cos(pre_phase), sin(pre_phase));
+    // printf("DEBUG get_pre_phase: Exit for i_patom=%ld\n", i_patom);
+    // fflush(stdout);
     return pre_phase_factor;
 }
 

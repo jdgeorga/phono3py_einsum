@@ -46,8 +46,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include <stdio.h>
 #include "lapack_wrapper.h"
+
 
 static void get_fc3_e0_e1_e2(
     double *fc3_normal_squared, const int64_t (*g_pos)[4],
@@ -116,6 +117,8 @@ void reciprocal_to_normal_squared(
     e1 = e0 + num_band * num_band;
     e2 = e1 + num_band * num_band;
 
+
+
 #ifdef _OPENMP
 #pragma omp parallel for private(i, j) if (!openmp_per_triplets)
 #endif
@@ -142,10 +145,64 @@ void reciprocal_to_normal_squared(
     free(inv_sqrt_masses);
     inv_sqrt_masses = NULL;
 
+    // printf("DEBUG reciprocal_to_normal: e0 values:\n");
+    // for (i = 0; i < num_band * num_band; i++) {
+    //     printf("%f %f, ", lapack_complex_double_real(e0[i]), lapack_complex_double_imag(e0[i]));
+    //     if ((i + 1) % 8 == 0) printf("\n");
+    // }
+    // printf("\n");
+
+    // printf("DEBUG reciprocal_to_normal: e1 values:\n"); 
+    // for (i = 0; i < num_band * num_band; i++) {
+    //     printf("%f %f, ", lapack_complex_double_real(e1[i]), lapack_complex_double_imag(e1[i]));
+    //     if ((i + 1) % 8 == 0) printf("\n");
+    // }
+    // printf("\n");
+
+    // printf("DEBUG reciprocal_to_normal: e2 values:\n");
+    // for (i = 0; i < num_band * num_band; i++) {
+    //     printf("%f %f, ", lapack_complex_double_real(e2[i]), lapack_complex_double_imag(e2[i]));
+    //     if ((i + 1) % 8 == 0) printf("\n");
+    // }
+    // printf("\n");
+    // fflush(stdout);
+
+    // printf("DEBUG reciprocal_to_normal: freqs0 values:\n");
+    // for (i = 0; i < num_band; i++) {
+    //     printf("%f, ", freqs0[i]);
+    // }
+    // printf("\n");
+
+    // printf("DEBUG reciprocal_to_normal: freqs1 values:\n");
+    // for (i = 0; i < num_band; i++) {
+    //     printf("%f, ", freqs1[i]);
+    // }
+    // printf("\n");
+    
+    // printf("DEBUG reciprocal_to_normal: freqs2 values:\n");
+    // for (i = 0; i < num_band; i++) {
+    //     printf("%f, ", freqs2[i]);
+    // }
+    // printf("\n");
+    
+    // printf("DEBUG reciprocal_to_normal: fc3_reciprocal values:\n");
+    // for (i = 0; i < num_band * num_band * num_band; i++) {
+    //     printf("%f %f, ", lapack_complex_double_real(fc3_reciprocal[i]), lapack_complex_double_imag(fc3_reciprocal[i]));
+    //     if ((i + 1) % 8 == 0) printf("\n");
+    // }
+    // printf("\n");
+
     get_fc3_e0_e1_e2(fc3_normal_squared, g_pos, num_g_pos, fc3_reciprocal,
                      freqs0, freqs1, freqs2, e0, e1, e2, band_indices,
                      num_band0, num_band, cutoff_frequency,
                      openmp_per_triplets);
+    // printf("DEBUG fc3_normal_squared shape: %ld %ld\n", num_g_pos, num_g_pos);
+    // printf("DEBUG fc3_normal_squared values:\n");
+    // for (i = 0; i < num_g_pos; i++) {
+    //     printf("%e, ", fc3_normal_squared[i]);
+    //     if ((i + 1) % 8 == 0) printf("\n");
+    // }
+    // printf("\n");
 
     free(e0);
     e0 = NULL;
@@ -180,7 +237,13 @@ static void get_fc3_e0_e1_e2(
         get_fc3_e0(fc3_e0 + i * num_band * num_band, fc3_reciprocal, e0,
                    band_indices[i], num_band);
     }
-
+    // printf("DEBUG fc3_e0 values:\n");
+    // for (i = 0; i < num_band0 * num_band * num_band; i++) {
+    //     printf("%f %f, ", lapack_complex_double_real(fc3_e0[i]), lapack_complex_double_imag(fc3_e0[i]));
+    //     if ((i + 1) % 8 == 0) printf("\n");
+    // }
+    // printf("\n");
+    // fflush(stdout);
 #ifdef _OPENMP
 #pragma omp parallel for if (!openmp_per_triplets)
 #endif

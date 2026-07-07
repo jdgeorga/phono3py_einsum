@@ -47,3 +47,14 @@ Testing
 
 # Rust
 rust/target/
+# --- reu_tests snapshot: exclude generated/binary artifacts (keep source+tests) ---
+phono3py/_version.py
+install.log
+test_no_flag
+test_with_flag
+*.npy
+*.pdf
+big_test/*.xyz
+bilayer_test/*.xyz
+einsum_test/*.xyz
+einsum_test/output.txt
