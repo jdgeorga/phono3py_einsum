@@ -158,6 +158,7 @@ class ConductivityRTA(ConductivityRTABase):
                     g_sum = self._get_main_diagonal(i, j, k)
                     for ll in range(num_band):
                         if frequencies[ll] < self._pp.cutoff_frequency:
+                            print("ignoring mode", ll)
                             self._num_ignored_phonon_modes[j, k] += 1  # type: ignore
                             continue
 

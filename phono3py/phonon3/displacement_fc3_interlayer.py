@@ -131,7 +131,7 @@ def direction_to_displacement(
 
 
 def get_third_order_displacements(
-    cell: PhonopyAtoms, symmetry: Symmetry, is_plusminus="auto", is_diagonal=False, is_layered=False
+    cell: PhonopyAtoms, symmetry: Symmetry, is_plusminus="auto", is_diagonal=False
 ):
     """Create displacement dataset.
 
@@ -156,10 +156,6 @@ def get_third_order_displacements(
         and plus and minus depending on site symmetry ('auto').
     is_diagonal : bool, optional
         Whether allow diagonal displacements of Atom 2 or not
-    is_layered : bool, optional
-        When True, distance calculation uses only in-plane (xy) components,
-        treating the structure as if flattened in the z-direction for 
-        layered materials. Default is False.
 
     Returns
     -------
@@ -206,15 +202,7 @@ def get_third_order_displacements(
             )
 
             min_vec = get_smallest_vector_of_atom_pair(atom1, atom2, cell, symprec)
-            if is_layered:
-                # For layered materials, calculate only in-plane distance (x,y components)
-                min_vec_cartesian = np.dot(lattice, min_vec)
-                # Set z-component to zero for in-plane distance calculation
-                min_vec_cartesian[2] = 0.0
-                min_distance = np.linalg.norm(min_vec_cartesian)
-            else:
-                # Standard 3D distance calculation
-                min_distance = np.linalg.norm(np.dot(lattice, min_vec))
+            min_distance = np.linalg.norm(np.dot(lattice, min_vec))
             dds_atom2["distance"] = min_distance
             dds_atom1["second_atoms"].append(dds_atom2)
         dds.append(dds_atom1)

@@ -94,7 +94,7 @@ from phono3py.phonon3.imag_self_energy import (
     get_imag_self_energy,
     write_imag_self_energy,
 )
-from phono3py.phonon3.interaction import Interaction
+from phono3py.phonon3.interaction_fast import Interaction
 from phono3py.phonon3.real_self_energy import (
     get_real_self_energy,
     write_real_self_energy,
@@ -1256,6 +1256,7 @@ class Phono3py:
         random_seed: int | None = None,
         max_distance: float | None = None,
         number_estimation_factor: float | None = None,
+        is_layered: bool = False,
     ):
         """Generate displacement dataset in supercell for fc3.
 
@@ -1333,6 +1334,10 @@ class Phono3py:
             This factor multiplies the number of snapshots estimated by symfc
             when `number_of_snapshots` is set to "auto". Default is None, which
             sets this factor to 8 when `max_distance` is specified, otherwise 4.
+        is_layered : bool, optional
+            When True, the cutoff distance is applied only to in-plane (xy) 
+            coordinates for layered materials. This allows interlayer interactions
+            to be included while limiting intralayer interactions. Default is False.
 
         """
         if distance is None:
@@ -1379,6 +1384,7 @@ class Phono3py:
                 self._symmetry,
                 is_plusminus=is_plusminus,
                 is_diagonal=is_diagonal,
+                is_layered=is_layered,
             )
             self._dataset = direction_to_displacement(
                 direction_dataset,
@@ -1739,7 +1745,9 @@ class Phono3py:
         write_txt=False,
         write_gamma_detail=False,
         keep_gamma_detail=False,
+        keep_reduced_gamma_detail=False,
         output_filename=None,
+        lang="C",
     ):
         """Calculate imaginary part of self-energy of bubble diagram (Gamma).
 
@@ -1787,8 +1795,16 @@ class Phono3py:
             Detailed gammas are written into a file in hdf5. Default is False.
         keep_gamma_detail : bool, optional
             With True, detailed gammas are stored. Default is False.
+        keep_reduced_gamma_detail : bool, optional
+            With True, only the band-summed reduced views of the detailed gamma
+            are returned (one (gamma_q1_sum, gamma_q2_sum) tuple per grid point)
+            instead of the full dense detailed gamma tensor. This is used by the
+            W-scattering driver to assemble the W matrix with much less memory.
+            Only supported with frequency_points_at_bands=True. Default is False.
         output_filename : str
             This string is inserted in the output file names.
+        lang : str, optional
+            Language to use for the calculation. Default is "C".
 
         """
         if self._interaction is None:
@@ -1819,10 +1835,14 @@ class Phono3py:
             scattering_event_class=scattering_event_class,
             write_gamma_detail=write_gamma_detail,
             return_gamma_detail=keep_gamma_detail,
+            return_reduced_gamma_detail=keep_reduced_gamma_detail,
             output_filename=output_filename,
             log_level=self._log_level,
+            lang=lang,
         )
-        if keep_gamma_detail:
+        if keep_reduced_gamma_detail:
+            (self._frequency_points, self._gammas, self._reduced_gammas) = vals
+        elif keep_gamma_detail:
             (self._frequency_points, self._gammas, self._detailed_gammas) = vals
         else:
             self._frequency_points, self._gammas = vals

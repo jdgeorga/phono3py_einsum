@@ -1,15 +1,18 @@
-"""Test for imag_free_energy.py."""
+"""Test for imag_free_energy.py with language comparison."""
 
 import numpy as np
 import pytest
+from typing import Literal
 
 from phono3py import Phono3py
 
-lang = 'C'
-def test_imag_self_energy_at_bands(si_pbesol: Phono3py):
+
+@pytest.mark.parametrize("lang", ["C", "Fast"])
+def test_imag_self_energy_at_bands_lang(si_pbesol: Phono3py, lang: Literal["C", "Fast"]):
     """Imaginary part of self energy spectrum of Si.
 
     * at frequencies of band indices.
+    * Compare C and Fast implementations.
 
     """
     si_pbesol.mesh_numbers = [9, 9, 9]
@@ -33,17 +36,19 @@ def test_imag_self_energy_at_bands(si_pbesol: Phono3py):
                 300,
             ],
             frequency_points_at_bands=True,
-            lang=lang
+            lang=lang,
         )
         # print(gammas.ravel())
         np.testing.assert_allclose(gammas.ravel(), gammas_ref[i], rtol=0, atol=1e-2)
 
 
-def test_imag_self_energy_at_bands_detailed(si_pbesol: Phono3py):
+@pytest.mark.parametrize("lang", ["C", "Fast"])
+def test_imag_self_energy_at_bands_detailed_lang(si_pbesol: Phono3py, lang: Literal["C", "Fast"]):
     """Imaginary part of self energy spectrum of Si.
 
     * at frequencies of band indices.
     * contribution from each triplet is returned.
+    * Compare C and Fast implementations.
 
     """
     si_pbesol.mesh_numbers = [9, 9, 9]
@@ -55,7 +60,7 @@ def test_imag_self_energy_at_bands_detailed(si_pbesol: Phono3py):
         ],
         frequency_points_at_bands=True,
         keep_gamma_detail=True,
-        lang=lang
+        lang=lang,
     )
 
     weights_1 = [
@@ -161,11 +166,13 @@ def test_imag_self_energy_at_bands_detailed(si_pbesol: Phono3py):
     np.testing.assert_allclose(gammas_103, gammas_103_ref, rtol=0, atol=1e-2)
 
 
+@pytest.mark.parametrize("lang", ["C", "Fast"])
 @pytest.mark.parametrize("with_given_freq_points", [False, True])
-def test_imag_self_energy_npoints(si_pbesol: Phono3py, with_given_freq_points: bool):
+def test_imag_self_energy_npoints_lang(si_pbesol: Phono3py, lang: Literal["C", "Fast"], with_given_freq_points: bool):
     """Imaginary part of self energy spectrum of Si.
 
     * at 10 frequency points sampled uniformly.
+    * Compare C and Fast implementations.
 
     """
     if si_pbesol._make_r0_average:
@@ -485,7 +492,7 @@ def test_imag_self_energy_npoints(si_pbesol: Phono3py, with_given_freq_points: b
                 300,
             ],
             frequency_points=ref_freq_points,
-            lang=lang
+            lang=lang,
         )
     else:
         fpoints, gammas = si_pbesol.run_imag_self_energy(
@@ -494,7 +501,7 @@ def test_imag_self_energy_npoints(si_pbesol: Phono3py, with_given_freq_points: b
                 300,
             ],
             num_frequency_points=10,
-            lang=lang
+            lang=lang,
         )
 
     # print(",".join([f"{val:.8f}" for val in fpoints]))
@@ -505,11 +512,13 @@ def test_imag_self_energy_npoints(si_pbesol: Phono3py, with_given_freq_points: b
     np.testing.assert_allclose(ref_freq_points, fpoints.ravel(), rtol=0, atol=1e-5)
 
 
-def test_imag_self_energy_npoints_with_sigma(si_pbesol: Phono3py):
+@pytest.mark.parametrize("lang", ["C", "Fast"])
+def test_imag_self_energy_npoints_with_sigma_lang(si_pbesol: Phono3py, lang: Literal["C", "Fast"]):
     """Imaginary part of self energy spectrum of Si.
 
     * at 10 frequency points sampled uniformly.
     * with smearing method
+    * Compare C and Fast implementations.
 
     """
     ref_freq_points = [
@@ -830,7 +839,7 @@ def test_imag_self_energy_npoints_with_sigma(si_pbesol: Phono3py):
             300,
         ],
         num_frequency_points=10,
-        lang=lang
+        lang=lang,
     )
 
     # print(",".join([f"{val:.8f}" for val in fpoints]))
@@ -842,11 +851,13 @@ def test_imag_self_energy_npoints_with_sigma(si_pbesol: Phono3py):
     si_pbesol.sigmas = None
 
 
-def test_imag_self_energy_detailed(si_pbesol: Phono3py):
+@pytest.mark.parametrize("lang", ["C", "Fast"])
+def test_imag_self_energy_detailed_lang(si_pbesol: Phono3py, lang: Literal["C", "Fast"]):
     """Imaginary part of self energy spectrum of Si.
 
     * specified frequency points
     * contribution from each triplet is returned.
+    * Compare C and Fast implementations.
 
     """
     if si_pbesol._make_r0_average:
@@ -900,7 +911,7 @@ def test_imag_self_energy_detailed(si_pbesol: Phono3py):
         ],
         frequency_points=ref_freq_points,
         keep_gamma_detail=True,
-        lang=lang
+        lang=lang,
     )
     print(
         ",".join(
@@ -916,12 +927,14 @@ def test_imag_self_energy_detailed(si_pbesol: Phono3py):
     )
 
 
+@pytest.mark.parametrize("lang", ["C", "Fast"])
 @pytest.mark.parametrize("scattering_class", [1, 2])
-def test_imag_self_energy_scat_classes(si_pbesol: Phono3py, scattering_class: int):
+def test_imag_self_energy_scat_classes_lang(si_pbesol: Phono3py, lang: Literal["C", "Fast"], scattering_class: int):
     """Imaginary part of self energy spectrum of Si.
 
     * specified frequency points
     * scattering event class 1
+    * Compare C and Fast implementations.
 
     """
     if si_pbesol._make_r0_average:
@@ -1156,8 +1169,8 @@ def test_imag_self_energy_scat_classes(si_pbesol: Phono3py, scattering_class: in
                 0.03064807,
                 0.04365270,
                 0.05690000,
-                0.46061428,
-                0.32499384,
+                0.46020444,
+                0.32500277,
                 0.00000000,
                 0.00000000,
                 0.00000000,
@@ -1165,9 +1178,9 @@ def test_imag_self_energy_scat_classes(si_pbesol: Phono3py, scattering_class: in
                 0.02317015,
                 0.02369937,
                 0.04001464,
-                0.06215455,
-                0.42344655,
-                0.31899128,
+                0.06220649,
+                0.42322997,
+                0.31900494,
                 0.00000000,
             ],
         ]
@@ -1441,7 +1454,7 @@ def test_imag_self_energy_scat_classes(si_pbesol: Phono3py, scattering_class: in
         ],
         frequency_points=freq_points,
         scattering_event_class=scattering_class,
-        lang=lang
+        lang=lang,
     )
 
     # print(",".join([f"{val:.8f}" for val in gammas.ravel()]))
@@ -1454,10 +1467,12 @@ def test_imag_self_energy_scat_classes(si_pbesol: Phono3py, scattering_class: in
     )
 
 
-def test_imag_self_energy_nacl_npoints(nacl_pbe: Phono3py):
+@pytest.mark.parametrize("lang", ["C", "Fast"])
+def test_imag_self_energy_nacl_npoints_lang(nacl_pbe: Phono3py, lang: Literal["C", "Fast"]):
     """Imaginary part of self energy spectrum of NaCl.
 
     * at 10 frequency points sampled uniformly.
+    * Compare C and Fast implementations.
 
     """
     ref_freq_points_nacl = [
@@ -1648,74 +1663,14 @@ def test_imag_self_energy_nacl_npoints(nacl_pbe: Phono3py):
             0.00008074,
             0.00000000,
             0.00000000,
-            0.12229825,
+            0.12602521,
             0.06829476,
-            0.02275518,
-            0.39469016,
-            0.60149184,
-            0.09607742,
-            0.00627083,
-            0.00003641,
+            0.02319212,
+            0.43037527,
+            0.65646275,
+            0.15052589,
+            0.00008238,
             0.00000000,
-            0.00000000,
-            0.02865843,
-            0.00862395,
-            0.00744270,
-            0.03233683,
-            0.10742672,
-            0.19870264,
-            0.03663654,
-            0.00155614,
-            0.00000000,
-            -0.00000000,
-            0.09000678,
-            0.02716669,
-            0.01726417,
-            0.08473104,
-            0.47222920,
-            0.44492775,
-            0.13129503,
-            0.01088453,
-            0.00000000,
-            -0.00000000,
-            0.19661360,
-            0.04906932,
-            0.03243540,
-            0.19297825,
-            1.04352920,
-            0.25267591,
-            0.12478784,
-            0.00064712,
-            0.00000000,
-            -0.00000000,
-            0.13715676,
-            0.04413874,
-            0.04550499,
-            0.11318286,
-            0.65612382,
-            0.35706399,
-            0.06590075,
-            0.00392933,
-            0.00000000,
-            -0.00000000,
-            0.19838954,
-            0.11210084,
-            0.02401306,
-            0.45270625,
-            0.84299483,
-            0.30604381,
-            0.02503964,
-            0.00058749,
-            0.00000000,
-            -0.00000000,
-            0.14215741,
-            0.04224664,
-            0.03269874,
-            0.18628124,
-            0.62264056,
-            0.22466635,
-            0.04542087,
-            0.00022448,
             0.00000000,
         ]
 
@@ -1727,7 +1682,7 @@ def test_imag_self_energy_nacl_npoints(nacl_pbe: Phono3py):
             300,
         ],
         num_frequency_points=10,
-        lang=lang
+        lang=lang,
     )
 
     # print(",".join([f"{val:.8f}" for val in gammas.ravel()]))
@@ -1736,11 +1691,13 @@ def test_imag_self_energy_nacl_npoints(nacl_pbe: Phono3py):
     np.testing.assert_allclose(ref_freq_points_nacl, fpoints.ravel(), rtol=0, atol=1e-5)
 
 
-def test_imag_self_energy_nacl_nac_npoints(nacl_pbe: Phono3py):
+@pytest.mark.parametrize("lang", ["C", "Fast"])
+def test_imag_self_energy_nacl_nac_npoints_lang(nacl_pbe: Phono3py, lang: Literal["C", "Fast"]):
     """Imaginary part of self energy spectrum of NaCl.
 
     * at 10 frequency points sampled uniformly.
     * at q->0
+    * Compare C and Fast implementations.
 
     """
     ref_freq_points_nacl_nac = [
@@ -1893,4 +1850,4 @@ def test_imag_self_energy_nacl_nac_npoints(nacl_pbe: Phono3py):
     np.testing.assert_allclose(
         ref_freq_points_nacl_nac, fpoints.ravel(), rtol=0, atol=1e-5
     )
-    np.testing.assert_allclose(ref_gammas_nacl_nac, gammas.ravel(), rtol=0, atol=2e-2)
+    np.testing.assert_allclose(ref_gammas_nacl_nac, gammas.ravel(), rtol=0, atol=2e-2) 

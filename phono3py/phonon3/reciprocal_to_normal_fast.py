@@ -86,6 +86,16 @@ class ReciprocalToNormalFast:
         e1, e2, e3 = self._eigenvectors[grid_triplet]
         f1, f2, f3 = self._frequencies[grid_triplet]
         num_band = len(f1)
+        num_atom = len(self._primitive)
+        
+        print("DEBUG _reciprocal_to_normal: f1 = ", f1[0])
+        print("DEBUG _reciprocal_to_normal: f2 = ", f2[0])
+        print("DEBUG _reciprocal_to_normal: f3 = ", f3[0])
+        print("DEBUG _reciprocal_to_normal: e1 = ", e1[0])
+        print("DEBUG _reciprocal_to_normal: e2 = ", e2[0])
+        print("DEBUG _reciprocal_to_normal: e3 = ", e3[0])
+        print("DEBUG _reciprocal_to_normal: grid_triplet = ", grid_triplet)
+
         cutoff = self._cutoff_frequency
         m = self._primitive.masses
         
@@ -106,7 +116,7 @@ class ReciprocalToNormalFast:
         ):
             return
 
-        b1_indices = band_indices[valid_i_indices]
+        b1_indices = np.array(band_indices)[valid_i_indices]
         b2_indices = valid_j_indices
         b3_indices = valid_k_indices
 
@@ -122,15 +132,21 @@ class ReciprocalToNormalFast:
         # This computes the sum over l,m,n for each i,j,k,I,J,K combination
         # The output shape is (num_atom, num_atom, num_atom,
         #                       n_valid_i, n_valid_j, n_valid_k)
-        
-        # Create a grid of masses for division
-        m = self._masses
+    
         
         # Get frequency arrays for valid bands
         f1_valid = f1[b1_indices]
         f2_valid = f2[b2_indices]
         f3_valid = f3[b3_indices]
         
+        print("DEBUG _reciprocal_to_normal: f1_valid = ", f1_valid[0])
+        print("DEBUG _reciprocal_to_normal: f2_valid = ", f2_valid[0])
+        print("DEBUG _reciprocal_to_normal: f3_valid = ", f3_valid[0])
+        print("DEBUG _reciprocal_to_normal: e1_valid = ", e1_valid[0])
+        print("DEBUG _reciprocal_to_normal: e2_valid = ", e2_valid[0])
+        print("DEBUG _reciprocal_to_normal: e3_valid = ", e3_valid[0])
+        print("DEBUG _reciprocal_to_normal: grid_triplet = ", grid_triplet)
+
         # Combined einsum including frequency normalization
         fc3_normal_valid = np.einsum(
             "ilI,jmJ,knK,ijklmn,i,j,k,I,J,K -> IJK",

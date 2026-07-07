@@ -87,7 +87,11 @@ class ReciprocalToNormal:
         f1, f2, f3 = self._frequencies[grid_triplet]
         num_band = len(f1)
         cutoff = self._cutoff_frequency
+        i_new = 0
         for i, j, k in list(np.ndindex(len(self._band_indices), num_band, num_band)):
+            if i != i_new:
+                i_new = i
+                print("i", i, flush=True)
             bi = self._band_indices[i]
             if f1[bi] > cutoff and f2[j] > cutoff and f3[k] > cutoff:
                 fc3_elem = self._sum_in_atoms((bi, j, k), (e1, e2, e3))

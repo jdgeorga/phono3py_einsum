@@ -517,7 +517,8 @@ class ConductivityRTAWriter:
                 gamma_U_at_sigma = None
             else:
                 gamma_U_at_sigma = gamma_U[i]
-
+            print(f"writing kappa to {filename}")
+            
             write_kappa_to_hdf5(
                 temperatures,
                 mesh,

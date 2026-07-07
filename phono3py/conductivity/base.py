@@ -501,8 +501,8 @@ class ConductivityBase(ABC):
         else:
             self._temperatures = np.array(temperatures, dtype="double")
         self._boundary_mfp = boundary_mfp
-
-        self._pp.nac_q_direction = None
+        #JDG
+        # self._pp.nac_q_direction = None
         (
             self._frequencies,
             self._eigenvectors,

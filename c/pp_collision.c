@@ -239,7 +239,7 @@ static void get_collision(
         fc3_normal_squared, num_band0, num_band, g_pos, num_g_pos, frequencies,
         eigenvectors, triplet, bzgrid, fc3, is_compact_fc3, atom_triplets,
         masses, band_indices, symmetrize_fc3_q, cutoff_frequency, 0, 0,
-        openmp_per_triplets);
+        openmp_per_triplets, NULL);
 
     ise_imag_self_energy_at_triplet(
         ise, num_band0, num_band, fc3_normal_squared, frequencies, triplet,

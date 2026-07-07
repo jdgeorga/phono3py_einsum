@@ -43,7 +43,7 @@
 #include "recgrid.h"
 
 void itr_get_interaction(
-    Darray *fc3_normal_squared, const char *g_zero, const Darray *frequencies,
+    Darray *fc3_normal_squared, const lapack_complex_double *fc3_reciprocal, const char *g_zero, const Darray *frequencies,
     const lapack_complex_double *eigenvectors, const int64_t (*triplets)[3],
     const int64_t num_triplets, const RecgridConstBZGrid *bzgrid,
     const double *fc3, const int64_t is_compact_fc3,
@@ -61,6 +61,13 @@ void itr_get_interaction_at_triplet(
     const double cutoff_frequency,
     const int64_t triplet_index, /* only for print */
     const int64_t num_triplets,  /* only for print */
-    const int64_t openmp_per_triplets);
+    const int64_t openmp_per_triplets, const lapack_complex_double *fc3_reciprocal);
+
+/* Functions for capturing fc3_reciprocal during interaction calculation */
+void itr_enable_fc3_reciprocal_capture(void);
+void itr_disable_fc3_reciprocal_capture(void);
+int64_t itr_get_captured_fc3_reciprocal(lapack_complex_double *fc3_reciprocal_out, 
+                                        double *q_vecs_out, int64_t max_size);
+void itr_clear_captured_fc3_reciprocal(void);
 
 #endif

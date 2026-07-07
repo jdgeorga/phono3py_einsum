@@ -37,8 +37,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from typing import Literal
-
+import time
 import numpy as np
+import multiprocessing as mp
+from functools import partial
 from numpy.typing import NDArray
 from phonopy.harmonic.dynamical_matrix import DynamicalMatrix, get_dynamical_matrix
 from phonopy.physical_units import get_physical_units
@@ -51,9 +53,80 @@ from phono3py.phonon.grid import (
     get_ir_grid_points,
 )
 from phono3py.phonon.solver import run_phonon_solver_c, run_phonon_solver_py
-from phono3py.phonon3.real_to_reciprocal import RealToReciprocal
+from phono3py.phonon3.real_to_reciprocal_fast import RealToReciprocalFast
+from phono3py.phonon3.real_to_reciprocal_o3 import RealToReciprocalO3
+from phono3py.phonon3.r2r_chunk import RealToReciprocalChunked
+from phono3py.phonon3.reciprocal_to_normal_fast import ReciprocalToNormalFast
 from phono3py.phonon3.reciprocal_to_normal import ReciprocalToNormal
+from phono3py.phonon3.real_to_reciprocal import RealToReciprocal
+from phono3py.phonon3.real_to_reciprocal_v3 import RealToReciprocalV3
+from phono3py.phonon3.real_to_reciprocal_exact import RealToReciprocalExact
+from phono3py.phonon3.reciprocal_to_normal_v3 import ReciprocalToNormalSquaredV3
 from phono3py.phonon3.triplets import get_nosym_triplets_at_q, get_triplets_at_q
+from phono3py.phonon3.real_to_reciprocal_gpu import RealToReciprocalExactGPU
+from phono3py.phonon3.reciprocal_to_normal_gpu import ReciprocalToNormalSquaredGPU
+
+
+def _process_triplet_worker(args):
+    """Worker function to process a single triplet."""
+    try:
+        (i, grid_triplet, fc3, primitive, mesh_numbers, symprec, make_r0_average, 
+         frequencies, eigenvectors, band_indices, cutoff_frequency, unit_conversion,
+         bz_grid_addresses, existing_fc3_reciprocal, phonon_done, all_shortest) = args
+        
+   
+        r2r = RealToReciprocalExact(
+            fc3, primitive, mesh_numbers, symprec=symprec, make_r0_average=make_r0_average,
+            all_shortest=all_shortest
+        )
+        
+        # Create ReciprocalToNormalSquaredV3 instance for this worker
+        r2n = ReciprocalToNormalSquaredV3(
+            primitive,
+            frequencies,
+            eigenvectors,
+            band_indices,
+            cutoff_frequency=cutoff_frequency,
+        )
+        
+        print(f"Processing triplet {i + 1}", flush=True)
+        start_time = time.time()
+        
+        # Run r2r transformation
+        r2r.run(bz_grid_addresses[grid_triplet])
+        r2r_time = time.time() - start_time
+        
+        # Get fc3_reciprocal
+        if np.sum(np.abs(existing_fc3_reciprocal)) < 1e-5:
+            fc3_reciprocal = r2r.get_fc3_reciprocal()
+            if fc3_reciprocal is not None:
+                fc3_reciprocal = fc3_reciprocal.reshape(existing_fc3_reciprocal.shape)
+            else:
+                fc3_reciprocal = existing_fc3_reciprocal
+        else:
+            fc3_reciprocal = existing_fc3_reciprocal
+        
+        # Run r2n transformation
+        start_time = time.time()
+        r2n.run(fc3_reciprocal, grid_triplet, method='super_fast')
+        r2n_time = time.time() - start_time
+        
+        fc3_normal_squared = r2n.get_reciprocal_to_normal_squared()
+        
+        if fc3_normal_squared is not None:
+            interaction_strength = fc3_normal_squared * unit_conversion
+        else:
+            interaction_strength = None
+        
+        print(f"Triplet {i + 1} completed - r2r: {r2r_time:.4f}s, r2n: {r2n_time:.4f}s", flush=True)
+        
+        return i, fc3_reciprocal, interaction_strength, grid_triplet
+        
+    except Exception as e:
+        print(f"Error processing triplet {i + 1}: {str(e)}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return i, None, None, grid_triplet
 
 
 class Interaction:
@@ -157,6 +230,7 @@ class Interaction:
         self._triplets_map_at_q = None
         self._ir_map_at_q = None
         self._interaction_strength = None
+        self._interaction_strength_gpu = None  # CuPy array, kept on GPU for efficiency
         self._g_zero = None
 
         self._phonon_done = None
@@ -181,9 +255,15 @@ class Interaction:
             (n_patom, n_satom, n_satom), dtype="byte", order="C"
         )
         self._get_all_shortest()
+        self._fc3_reciprocal = None
 
-    def run(self, lang: Literal["C", "Python"] = "C", g_zero: NDArray | None = None):
+    def run(self,
+            lang: Literal["C", "Python", "Fast", "V3", "GPU", "GPU_phase", "Hybrid"] = "C",
+            g_zero: NDArray | None = None,
+            num_processes: int | None = None
+    ):
         """Run ph-ph interaction calculation."""
+
         if self._phonon_all_done:
             self.run_phonon_solver()
 
@@ -192,20 +272,46 @@ class Interaction:
 
         num_band = len(self._primitive) * 3
         num_triplets = len(self._triplets_at_q)
-        print(f"num_triplets: {num_triplets}")
-        print(f"num_band: {num_band}")
-        print(f"len(self._band_indices): {len(self._band_indices)}")
-        
+
+        # Allocate fc3(q) storage only for CPU-style backends.
+        # The GPU and Hybrid paths never require the full
+        # (num_triplets, natom, natom, natom, 3, 3, 3) array and
+        # preallocating it can cost tens of GB for large systems.
+        #
+        # For GPU / Hybrid, fc3 is kept and processed entirely on
+        # device via RealToReciprocalExactGPU, so we skip this
+        # allocation to avoid huge host RAM usage.
+        if self._fc3_reciprocal is None and lang in ("C", "Fast", "V3"):
+            self._fc3_reciprocal = np.zeros(
+                (num_triplets,
+                 len(self._primitive),
+                 len(self._primitive),
+                 len(self._primitive),
+                 3, 3, 3),
+                dtype="complex128",
+            )
 
         self._interaction_strength = np.empty(
             (num_triplets, len(self._band_indices), num_band, num_band), dtype="double"
         )
+        
         if self._constant_averaged_interaction is None:
             self._interaction_strength[:] = 0
             if lang == "C":
                 self._run_c(g_zero)
+            elif lang == "Fast":
+                self._run_fast(g_zero, num_processes)
+            elif lang == "V3":
+                self._run_v3(g_zero)
+            elif lang == "GPU":
+                self._run_gpu(g_zero)
+            elif lang == "GPU_phase":
+                self._run_gpu(g_zero, phase_vectorized=True)
+            elif lang == "Hybrid":
+                self._run_hybrid(g_zero)
             else:
-                self._run_py()
+                # self _run_py() # original py implementation JDG Dec 9 2025
+                self._run_py_test() # new py test JDG Dec 9 2025
         else:
             num_grid = np.prod(self.mesh_numbers)
             self._interaction_strength[:] = (
@@ -224,6 +330,14 @@ class Interaction:
 
         """
         return self._interaction_strength
+
+    @property
+    def interaction_strength_gpu(self):
+        """Return ph-ph interaction strength as CuPy array (if available).
+        
+        Returns None if GPU computation wasn't used or data isn't on GPU.
+        """
+        return self._interaction_strength_gpu
 
     @property
     def mesh_numbers(self) -> NDArray:
@@ -251,6 +365,23 @@ class Interaction:
     def fc3_nonzero_indices(self) -> NDArray:
         """Return fc3_nonzero_indices."""
         return self._fc3_nonzero_indices
+
+    @property
+    def fc3_reciprocal(self) -> NDArray | None:
+        """Return fc3_reciprocal.
+        
+        Returns
+        -------
+        ndarray or None
+            shape=(num_triplets, num_atoms, num_atoms, num_atoms, 3, 3, 3),
+            dtype='complex128', order='C'
+            
+        """
+        return self._fc3_reciprocal
+
+    @fc3_reciprocal.setter
+    def fc3_reciprocal(self, fc3_reciprocal):
+        self._fc3_reciprocal = fc3_reciprocal
 
     @property
     def dynamical_matrix(self) -> DynamicalMatrix | None:
@@ -466,7 +597,7 @@ class Interaction:
         """Set interaction strength."""
         self._interaction_strength = pp_strength
         self._g_zero = g_zero
-
+        
     def set_grid_point(self, grid_point, store_triplets_map=False):
         """Set grid point and prepare grid point triplets."""
         if not self._is_mesh_symmetry:
@@ -549,6 +680,7 @@ class Interaction:
 
         self._triplets_at_q = triplets_at_q
         self._weights_at_q = weights_at_q
+        self._fc3_reciprocal = None  # must be reallocated for new triplet count
 
         if store_triplets_map:
             self._triplets_map_at_q = triplets_map_at_q
@@ -825,6 +957,7 @@ class Interaction:
         """
         self._interaction_strength = None
         self._g_zero = None
+        self._fc3_reciprocal = None
 
     def _set_fc3(self, fc3: NDArray, fc3_nonzero_indices: NDArray | None = None):
         if (
@@ -872,7 +1005,8 @@ class Interaction:
 
         assert self._interaction_strength is not None
         assert self._triplets_at_q is not None
-
+        assert self._fc3_reciprocal is not None
+        
         num_band = len(self._primitive) * 3
         if g_zero is None or self._symmetrize_fc3q:
             _g_zero = np.zeros(
@@ -895,6 +1029,7 @@ class Interaction:
 
         phono3c.interaction(
             self._interaction_strength,
+            self._fc3_reciprocal,
             _g_zero,
             self._frequencies,
             self._eigenvectors,
@@ -916,7 +1051,11 @@ class Interaction:
             self._cutoff_frequency,
             openmp_per_triplets * 1,
         )
+
         self._interaction_strength *= self._unit_conversion
+        # for i in range(len(self._triplets_at_q)):
+        #     print("DEBUG CAPTURE: post C interaction_strength %d = " % i, self._interaction_strength[i].flatten()[:3])
+
         self._g_zero = g_zero
 
     def _run_phonon_solver_c(self, grid_points):
@@ -933,14 +1072,408 @@ class Interaction:
             lapack_zheev_uplo=self._lapack_zheev_uplo,
         )
 
+    def _run_fast(self, g_zero, num_processes=None):
+        """Parallelized version using multiprocessing.
+        
+        This method parallelizes the processing of grid triplets using multiprocessing.
+        Each triplet is processed independently in a separate process, which can
+        significantly speed up computation on multi-core systems.
+        
+        Parameters
+        ----------
+        g_zero : ndarray or None
+            Zero value positions (not used in current implementation).
+        num_processes : int or None, optional
+            Number of processes to use for parallel computation.
+            If None (default), uses min(cpu_count(), num_triplets).
+            If 1, runs sequentially for debugging purposes.
+            
+        Notes
+        -----
+        - All phonon calculations must be completed before calling this method
+        - Each worker process creates its own RealToReciprocalFast and 
+          ReciprocalToNormalSquaredV3 instances
+        - Results are collected and merged back into the main instance arrays
+        - Error handling is included to prevent process crashes from stopping
+          the entire calculation
+          
+        Examples
+        --------
+        # Auto-detect number of processes
+        interaction._run_fast(g_zero=None)
+        
+        # Use specific number of processes
+        interaction._run_fast(g_zero=None, num_processes=4)
+        
+        # Sequential execution for debugging
+        interaction._run_fast(g_zero=None, num_processes=1)
+        """
+        assert self._interaction_strength is not None
+        assert self._triplets_at_q is not None
+        assert self._frequencies is not None
+        assert self._eigenvectors is not None
+        assert self._make_r0_average is not None
+        assert self._fc3_reciprocal is not None
+        
+        if num_processes is None:
+            num_processes = min(mp.cpu_count(), len(self._triplets_at_q))
+        
+        print(f"Using {num_processes} processes for {len(self._triplets_at_q)} triplets")
+        
+        # Ensure all phonons are solved before parallel processing
+        for i, grid_triplet in enumerate(self._triplets_at_q):
+            for gp in grid_triplet:
+                self._run_phonon_solver_py(gp)
+        
+        # Prepare arguments for parallel processing
+        args_list = []
+        for i, grid_triplet in enumerate(self._triplets_at_q):
+            args = (
+                i, grid_triplet, self._fc3, self._primitive, self.mesh_numbers, 
+                self._symprec, self._make_r0_average, self._frequencies, 
+                self._eigenvectors, self._band_indices, self._cutoff_frequency,
+                self._unit_conversion, self._bz_grid.addresses, 
+                self._fc3_reciprocal[i], self._phonon_done, self._all_shortest
+            )
+            args_list.append(args)
+        
+        # Process triplets in parallel
+        start_time = time.time()
+        if num_processes == 1:
+            # Sequential processing for debugging
+            results = [_process_triplet_worker(args) for args in args_list]
+        else:
+            # Parallel processing
+            with mp.Pool(processes=num_processes) as pool:
+                results = pool.map(_process_triplet_worker, args_list)
+        
+        total_time = time.time() - start_time
+        print(f"Parallel processing completed in {total_time:.4f} seconds")
+        
+        # Collect results
+        successful_count = 0
+        for result in results:
+            if result is None:
+                continue
+            i, fc3_reciprocal, interaction_strength, grid_triplet = result
+            
+            if fc3_reciprocal is not None:
+                self._fc3_reciprocal[i] = fc3_reciprocal
+            
+            if interaction_strength is not None:
+                self._interaction_strength[i] = interaction_strength
+                successful_count += 1
+        
+        print(f"Parallel processing completed: {successful_count}/{len(self._triplets_at_q)} triplets processed successfully")
+
+    def _run_v3(self, g_zero):
+        assert self._interaction_strength is not None
+        assert self._triplets_at_q is not None
+        assert self._frequencies is not None
+        assert self._eigenvectors is not None
+        assert self._make_r0_average is not None
+        assert self._fc3_reciprocal is not None
+        
+        r2r = RealToReciprocalExact(
+            self._fc3, self._primitive, self.mesh_numbers, symprec=self._symprec, 
+            make_r0_average=self._make_r0_average, all_shortest=self._all_shortest
+        )
+        
+        # r2r = RealToReciprocal(
+        #     self._fc3, self._primitive, self.mesh_numbers, symprec=self._symprec
+        # )
+
+        r2n = ReciprocalToNormalSquaredV3(
+            self._primitive,
+            self._frequencies,
+            self._eigenvectors,
+            self._band_indices,
+            cutoff_frequency=self._cutoff_frequency,
+        )
+
+        for i, grid_triplet in enumerate(self._triplets_at_q):
+            print("%d / %d" % (i + 1, len(self._triplets_at_q)),flush=True)
+            r2r.run(self._bz_grid.addresses[grid_triplet])
+            # print("DEBUG CAPTURE: r2r.get_fc3_reciprocal() shape:", r2r.get_fc3_reciprocal().shape)
+            # print("DEBUG CAPTURE: r2r.get_fc3_reciprocal() first 5 elements:", r2r.get_fc3_reciprocal().flatten()[:5])
+         
+            # r2r_slow.run(self._bz_grid.addresses[grid_triplet])
+            # print("r2r - r2r_slow", np.abs(r2r.get_fc3_reciprocal() - r2r_slow.get_fc3_reciprocal()).sum())
+            # print("compare r2r and r2r_slow", np.allclose(r2r.get_fc3_reciprocal(), r2r_slow.get_fc3_reciprocal(),rtol=0, atol=1e-10))
+   
+            if np.sum(np.abs(self._fc3_reciprocal[i])) < 1e-5:
+           
+                fc3_reciprocal = r2r.get_fc3_reciprocal()
+                if self._fc3_reciprocal is not None:
+                    self._fc3_reciprocal[i] = fc3_reciprocal.reshape(self._fc3_reciprocal[i].shape)
+            else:
+                fc3_reciprocal = self._fc3_reciprocal[i]
+                # print("fc3_reciprocal[i] first 5 elements:", fc3_reciprocal.flatten()[:5])
+            for gp in grid_triplet:
+                self._run_phonon_solver_py(gp)
+                
+            print("grid_triplet:", grid_triplet)
+
+            start_time = time.time()
+            r2n.run(self._fc3_reciprocal[i], grid_triplet, method='super_fast')
+            end_time = time.time()
+            print(f"r2n.run() took {end_time - start_time:.4f} seconds")
+            fc3_normal_squared = r2n.get_reciprocal_to_normal_squared()
+
+            assert fc3_normal_squared is not None
+            # fc3_normal_squared = np.abs(fc3_normal) ** 2
+            self._interaction_strength[i] = (
+                fc3_normal_squared * self._unit_conversion
+            )
+            # print("DEBUG CAPTURE: post py interaction_strength = ", self._interaction_strength[i].flatten()[:3])
+            
+    def _run_gpu(self, g_zero, phase_vectorized=False):
+        """GPU implementation for ph-ph interaction calculation.
+
+        Uses RealToReciprocalExactGPU for real->reciprocal transform and
+        ReciprocalToNormalSquaredGPU for the band-space contraction.
+        
+        Optimized to:
+        1. Pre-run all phonon solvers first
+        2. Use batched r2r.run_batch() to process ALL triplets at once
+        3. Keep data on GPU between transformations
+        """
+        import cupy as cp
+        import time
+        
+        # Timing dictionary to collect results
+        timing = {}
+        
+        assert self._interaction_strength is not None
+        assert self._triplets_at_q is not None
+        assert self._frequencies is not None
+        assert self._eigenvectors is not None
+        assert self._fc3 is not None
+
+        num_atom = len(self._primitive)
+        num_band = num_atom * 3
+        num_triplets = len(self._triplets_at_q)
+
+        # Step 1: Pre-run phonon solver for ALL grid points needed
+        t_start = time.perf_counter()
+        all_grid_points = set()
+        for grid_triplet in self._triplets_at_q:
+            for gp in grid_triplet:
+                all_grid_points.add(gp)
+        
+        for gp in all_grid_points:
+            self._run_phonon_solver_py(gp)
+        timing['phonon_solver'] = time.perf_counter() - t_start
+
+        # Step 2: Prepare all triplet addresses for batched computation
+        t_start = time.perf_counter()
+        all_triplet_addresses = np.array([
+            self._bz_grid.addresses[grid_triplet] 
+            for grid_triplet in self._triplets_at_q
+        ])  # Shape: (num_triplets, 3, 3)
+        timing['prepare_addresses'] = time.perf_counter() - t_start
+
+        # Step 3: Create GPU objects
+        t_start = time.perf_counter()
+        r2r = RealToReciprocalExactGPU(
+            self._fc3,
+            self._primitive,
+            self.mesh_numbers,
+            symprec=self._symprec,
+            make_r0_average=self._make_r0_average,
+            all_shortest=self._all_shortest,
+            phase_vectorized=phase_vectorized,
+        )
+        cp.cuda.Stream.null.synchronize()
+        timing['r2r_init'] = time.perf_counter() - t_start
+
+        t_start = time.perf_counter()
+        r2n_gpu = ReciprocalToNormalSquaredGPU(
+            self._primitive,
+            self._frequencies,
+            self._eigenvectors,
+            self._band_indices,
+            cutoff_frequency=self._cutoff_frequency,
+        )
+        cp.cuda.Stream.null.synchronize()
+        timing['r2n_init'] = time.perf_counter() - t_start
+
+        # Estimate batch size for triplets based on GPU memory
+        # Each triplet needs: fc3_reciprocal (P*P*P*3*3*3*16 bytes) + interaction_strength (B0*B*B*8 bytes)
+        num_band0 = len(self._band_indices)
+        bytes_per_triplet_fc3 = num_atom * num_atom * num_atom * 3 * 3 * 3 * 16  # complex128
+        bytes_per_triplet_pp = num_band0 * num_band * num_band * 8  # float64
+        bytes_per_triplet = bytes_per_triplet_fc3 + bytes_per_triplet_pp
+        
+        try:
+            free_mem = cp.cuda.Device().mem_info[0]
+            # Use at most 30% of free memory for triplet batches (leave room for intermediates)
+            triplet_batch_size = max(1, int(0.6 * free_mem / bytes_per_triplet))
+        except Exception:
+            triplet_batch_size = 10  # Conservative default
+
+        triplet_batch_size = min(triplet_batch_size, num_triplets)
+        num_triplet_batches = (num_triplets + triplet_batch_size - 1) // triplet_batch_size
+        
+        print(f"  [DEBUG] Triplet batching: {num_triplets} triplets in {num_triplet_batches} batches of ~{triplet_batch_size}")
+        print(f"  [DEBUG] Per-triplet memory: fc3={bytes_per_triplet_fc3/1e6:.1f}MB, pp={bytes_per_triplet_pp/1e6:.1f}MB")
+        
+        # Step 4 & 5: Process triplets in batches
+        t_start = time.perf_counter()
+        timing['r2r_batch'] = 0.0
+        timing['r2n_loop_run'] = 0.0
+        timing['r2n_loop_get'] = 0.0
+        
+        # Store results on CPU (will be transferred in batches during ISE)
+        # This avoids the 16+ GB GPU allocation
+        for batch_idx in range(num_triplet_batches):
+            batch_start = batch_idx * triplet_batch_size
+            batch_end = min(batch_start + triplet_batch_size, num_triplets)
+            batch_triplet_addresses = all_triplet_addresses[batch_start:batch_end]
+            
+            # R2R for this batch of triplets
+            t_r2r = time.perf_counter()
+            fc3_reciprocal_batch_gpu = r2r.run_batch(batch_triplet_addresses, return_gpu=True)
+            cp.cuda.Stream.null.synchronize()
+            timing['r2r_batch'] += time.perf_counter() - t_r2r
+            
+            if fc3_reciprocal_batch_gpu is None:
+                raise RuntimeError("GPU real-to-reciprocal returned None.")
+            
+            # R2N for each triplet in this batch
+            for i_local, i_global in enumerate(range(batch_start, batch_end)):
+                grid_triplet = self._triplets_at_q[i_global]
+                fc3q_gpu = fc3_reciprocal_batch_gpu[i_local]
+                
+                t_run = time.perf_counter()
+                r2n_gpu.run(fc3q_gpu, grid_triplet, method="super_fast", return_gpu=False)
+                timing['r2n_loop_run'] += time.perf_counter() - t_run
+                
+                t_get = time.perf_counter()
+                fc3_normal_squared = r2n_gpu.get_reciprocal_to_normal_squared()
+                timing['r2n_loop_get'] += time.perf_counter() - t_get
+                
+                if fc3_normal_squared is None:
+                    raise RuntimeError("GPU reciprocal-to-normal returned None.")
+                
+                # Store on CPU (the pre-allocated array)
+                self._interaction_strength[i_global] = fc3_normal_squared * self._unit_conversion
+            
+            # Free batch GPU memory
+            del fc3_reciprocal_batch_gpu
+            cp.get_default_memory_pool().free_all_blocks()
+        
+        # No GPU array for all triplets (too large) - ISE will process in batches from CPU
+        self._interaction_strength_gpu = None
+        
+        timing['r2n_loop_total'] = time.perf_counter() - t_start
+        
+        # Print timing summary
+        # r2n_loop_total includes r2r_batch, r2n_loop_run, r2n_loop_get
+        total_time = (timing['phonon_solver'] + timing['prepare_addresses'] + 
+                      timing['r2r_init'] + timing['r2n_init'] + timing['r2n_loop_total'])
+        
+        print(f"\n[GPU TIMING] _run_gpu breakdown ({num_triplets} triplets in {num_triplet_batches} batches, {num_atom} atoms):")
+        print(f"  Step 1 - Phonon solver:      {timing['phonon_solver']:8.4f} s")
+        print(f"  Step 2 - Prepare addresses:  {timing['prepare_addresses']:8.4f} s")
+        print(f"  Step 3 - R2R GPU init:       {timing['r2r_init']:8.4f} s")
+        print(f"  Step 3 - R2N GPU init:       {timing['r2n_init']:8.4f} s")
+        print(f"  Step 4+5 - Batched R2R+R2N:  {timing['r2n_loop_total']:8.4f} s")
+        print(f"           - R2R batch total:  {timing['r2r_batch']:8.4f} s")
+        print(f"           - R2N run total:    {timing['r2n_loop_run']:8.4f} s")
+        print(f"           - R2N get result:   {timing['r2n_loop_get']:8.4f} s")
+        print(f"  ----------------------------------------")
+        print(f"  TOTAL:                       {total_time:8.4f} s\n", flush=True)
+
+    def _run_hybrid(self, g_zero):
+        """Hybrid C+GPU implementation for ph-ph interaction calculation.
+
+        Uses fast C implementation (RealToReciprocalExact) for real->reciprocal
+        transform, and GPU (ReciprocalToNormalSquaredGPU) for the band-space 
+        contraction where matrix operations benefit from GPU acceleration.
+        
+        This is the best of both worlds:
+        - C is highly optimized for R2R with OpenMP parallelization
+        - GPU excels at the large matrix contractions in R2N
+        """
+        assert self._interaction_strength is not None
+        assert self._triplets_at_q is not None
+        assert self._frequencies is not None
+        assert self._eigenvectors is not None
+        assert self._fc3 is not None
+
+        num_atom = len(self._primitive)
+        num_band = num_atom * 3
+
+        # Use fast C implementation for real->reciprocal
+        r2r = RealToReciprocalExact(
+            self._fc3,
+            self._primitive,
+            self.mesh_numbers,
+            symprec=self._symprec,
+            make_r0_average=self._make_r0_average,
+            all_shortest=self._all_shortest,
+        )
+
+        # Use GPU for reciprocal->normal (large matrix ops benefit from GPU)
+        r2n_gpu = ReciprocalToNormalSquaredGPU(
+            self._primitive,
+            self._frequencies,
+            self._eigenvectors,
+            self._band_indices,
+            cutoff_frequency=self._cutoff_frequency,
+        )
+
+        for i, grid_triplet in enumerate(self._triplets_at_q):
+            # Ensure phonons for q0, q1, q2 exist
+            for gp in grid_triplet:
+                self._run_phonon_solver_py(gp)
+
+            # Real -> reciprocal using FAST C implementation
+            r2r.run(self._bz_grid.addresses[grid_triplet])
+            fc3q = r2r.get_fc3_reciprocal()
+            
+            if fc3q is None:
+                raise RuntimeError("C real-to-reciprocal returned None.")
+            
+            # Handle different output shapes from r2r
+            if fc3q.shape == (num_atom, num_atom, num_atom, 3, 3, 3):
+                fc3q_6d = fc3q
+            elif fc3q.shape == (num_band, num_band, num_band):
+                fc3q_6d = fc3q.reshape(
+                    num_atom, 3, num_atom, 3, num_atom, 3
+                ).transpose(0, 2, 4, 1, 3, 5)
+            else:
+                raise ValueError(f"Unexpected fc3q shape: {fc3q.shape}")
+            
+            # Store fc3_reciprocal if allocated
+            if self._fc3_reciprocal is not None:
+                self._fc3_reciprocal[i] = fc3q_6d
+
+            # Reciprocal -> normal on GPU (returns |V|^2 / (ω0 ω1 ω2))
+            r2n_gpu.run(fc3q_6d, grid_triplet, method="super_fast")
+            fc3_normal_squared = r2n_gpu.get_reciprocal_to_normal_squared()
+            
+            if fc3_normal_squared is None:
+                raise RuntimeError("GPU reciprocal-to-normal returned None.")
+            
+            self._interaction_strength[i] = fc3_normal_squared * self._unit_conversion
+        
     def _run_py(self):
+        """Python implementation matching C behavior."""
         assert self._interaction_strength is not None
         assert self._triplets_at_q is not None
         assert self._frequencies is not None
         assert self._eigenvectors is not None
 
-        r2r = RealToReciprocal(
-            self._fc3, self._primitive, self.mesh_numbers, symprec=self._symprec
+        num_atom = len(self._primitive)
+        num_band = num_atom * 3
+
+        # Use RealToReciprocalExact with all_shortest to match C
+        r2r = RealToReciprocalExact(
+            self._fc3, self._primitive, self.mesh_numbers, 
+            symprec=self._symprec, make_r0_average=self._make_r0_average,
+            all_shortest=self._all_shortest
         )
         r2n = ReciprocalToNormal(
             self._primitive,
@@ -952,16 +1485,209 @@ class Interaction:
 
         for i, grid_triplet in enumerate(self._triplets_at_q):
             print("%d / %d" % (i + 1, len(self._triplets_at_q)))
-            r2r.run(self._bz_grid.addresses[grid_triplet])
-            fc3_reciprocal = r2r.get_fc3_reciprocal()
+            
             for gp in grid_triplet:
                 self._run_phonon_solver_py(gp)
-            r2n.run(fc3_reciprocal, grid_triplet)
+            
+            r2r.run(self._bz_grid.addresses[grid_triplet])
+            fc3_reciprocal = r2r.get_fc3_reciprocal()
+            
+            # RealToReciprocalExact returns (nb, nb, nb), convert to 6D for r2n
+            if fc3_reciprocal.shape == (num_band, num_band, num_band):
+                fc3_reciprocal_6d = fc3_reciprocal.reshape(
+                    num_atom, 3, num_atom, 3, num_atom, 3
+                ).transpose(0, 2, 4, 1, 3, 5)
+            else:
+                fc3_reciprocal_6d = fc3_reciprocal
+            
+            r2n.run(fc3_reciprocal_6d, grid_triplet)
             fc3_normal = r2n.get_reciprocal_to_normal()
             assert fc3_normal is not None
             self._interaction_strength[i] = (
                 np.abs(fc3_normal) ** 2 * self._unit_conversion
             )
+            
+    def _run_py_test(self):
+        """Test to compare Python and GPU implementations step by step."""
+        assert self._interaction_strength is not None
+        assert self._triplets_at_q is not None
+        assert self._frequencies is not None
+        assert self._eigenvectors is not None
+
+        num_atom = len(self._primitive)
+        num_band = num_atom * 3
+        
+        print("=" * 60)
+        print("DEBUG TEST: Comparing Python vs GPU implementations")
+        print(f"num_atom = {num_atom}, num_band = {num_band}")
+        print("=" * 60)
+
+        # Python real-to-reciprocal (using RealToReciprocalExact to match C)
+        r2r_py = RealToReciprocalExact(
+            self._fc3, self._primitive, self.mesh_numbers, 
+            symprec=self._symprec, make_r0_average=self._make_r0_average,
+            all_shortest=self._all_shortest,
+        )
+        
+        # GPU real-to-reciprocal (uses RealToReciprocalExact, returns 3D)
+        r2r_gpu = RealToReciprocalExactGPU(
+            self._fc3,
+            self._primitive,
+            self.mesh_numbers,
+            symprec=self._symprec,
+            make_r0_average=self._make_r0_average,
+            all_shortest=self._all_shortest,
+        )
+        
+        # Python reciprocal-to-normal (returns complex fc3_normal)
+        r2n_py = ReciprocalToNormal(
+            self._primitive,
+            self._frequencies,
+            self._eigenvectors,
+            self._band_indices,
+            cutoff_frequency=self._cutoff_frequency,
+        )
+        
+        # GPU reciprocal-to-normal (returns real |V|^2)
+        r2n_gpu = ReciprocalToNormalSquaredGPU(
+            self._primitive,
+            self._frequencies,
+            self._eigenvectors,
+            self._band_indices,
+            cutoff_frequency=self._cutoff_frequency,
+        )
+
+        for i, grid_triplet in enumerate(self._triplets_at_q):
+            print(f"\n{'='*60}")
+            print(f"Triplet {i + 1} / {len(self._triplets_at_q)}: {grid_triplet}")
+            print(f"{'='*60}")
+            
+            # Ensure phonons are computed
+            for gp in grid_triplet:
+                self._run_phonon_solver_py(gp)
+            
+            # ============================================================
+            # STEP 1: Compare Real-to-Reciprocal outputs
+            # ============================================================
+            print("\n--- STEP 1: Real-to-Reciprocal comparison ---")
+            
+            r2r_py.run(self._bz_grid.addresses[grid_triplet])
+            fc3_recip_py = r2r_py.get_fc3_reciprocal()
+            
+            r2r_gpu.run(self._bz_grid.addresses[grid_triplet])
+            fc3_recip_gpu = r2r_gpu.get_fc3_reciprocal()
+            
+            print(f"Python fc3_reciprocal shape: {fc3_recip_py.shape}")
+            print(f"GPU fc3_reciprocal shape:    {fc3_recip_gpu.shape}")
+            
+            # The Python RealToReciprocal returns (na, na, na, 3, 3, 3)
+            # The RealToReciprocalExact returns (nb, nb, nb)
+            # We need to compare them in a common format
+            
+            if fc3_recip_py.shape == (num_atom, num_atom, num_atom, 3, 3, 3):
+                # Convert Python 6D to 3D for comparison
+                # fc3_py_3d[a0*3+c0, a1*3+c1, a2*3+c2] = fc3_py_6d[a0, a1, a2, c0, c1, c2]
+                fc3_py_3d = fc3_recip_py.transpose(0, 3, 1, 4, 2, 5).reshape(num_band, num_band, num_band)
+                print(f"Python fc3 (converted to 3D): {fc3_py_3d.shape}")
+            else:
+                fc3_py_3d = fc3_recip_py.reshape(num_band, num_band, num_band)
+            
+            if fc3_recip_gpu.shape == (num_band, num_band, num_band):
+                fc3_gpu_3d = fc3_recip_gpu
+            else:
+                # If GPU returns 6D, convert to 3D
+                fc3_gpu_3d = fc3_recip_gpu.transpose(0, 3, 1, 4, 2, 5).reshape(num_band, num_band, num_band)
+            
+            print(f"Python fc3_3d first 5 elements: {fc3_py_3d.flatten()[:5]}")
+            print(f"GPU fc3_3d first 5 elements:    {fc3_gpu_3d.flatten()[:5]}")
+            
+            fc3_diff = np.abs(fc3_py_3d - fc3_gpu_3d)
+            print(f"Max |fc3_py - fc3_gpu|: {fc3_diff.max():.6e}")
+            print(f"Mean |fc3_py - fc3_gpu|: {fc3_diff.mean():.6e}")
+            
+            if fc3_diff.max() > 1e-8:
+                print("WARNING: fc3_reciprocal differs significantly!")
+                # Find where max difference is
+                max_idx = np.unravel_index(np.argmax(fc3_diff), fc3_diff.shape)
+                print(f"Max diff at index {max_idx}")
+                print(f"  Python: {fc3_py_3d[max_idx]}")
+                print(f"  GPU:    {fc3_gpu_3d[max_idx]}")
+            else:
+                print("OK: fc3_reciprocal matches within tolerance")
+            
+            # ============================================================
+            # STEP 2: Compare Reciprocal-to-Normal outputs
+            # ============================================================
+            print("\n--- STEP 2: Reciprocal-to-Normal comparison ---")
+            
+            # Python r2n expects 6D input - convert fc3_py_3d to 6D
+            fc3_py_6d = fc3_py_3d.reshape(num_atom, 3, num_atom, 3, num_atom, 3).transpose(0, 2, 4, 1, 3, 5)
+            r2n_py.run(fc3_py_6d, grid_triplet)
+            fc3_normal_py = r2n_py.get_reciprocal_to_normal()
+            
+            # GPU r2n - convert GPU fc3 to 6D format
+            fc3_gpu_6d = fc3_gpu_3d.reshape(num_atom, 3, num_atom, 3, num_atom, 3).transpose(0, 2, 4, 1, 3, 5)
+            
+            print(f"Python fc3_normal shape: {fc3_normal_py.shape}")
+            print(f"Python fc3_normal dtype: {fc3_normal_py.dtype}")
+            
+            # Compute |V|^2 from Python
+            # Python returns complex fc3_normal, normalized by sqrt(f1*f2*f3)
+            # So |fc3_normal|^2 gives us the interaction strength (before unit_conversion)
+            fc3_normal_squared_py = np.abs(fc3_normal_py) ** 2
+            print(f"Python |fc3_normal|^2 shape: {fc3_normal_squared_py.shape}")
+            
+            # GPU r2n returns |V|^2 / (f1*f2*f3), which is the same as |fc3_normal|^2
+            # since fc3_normal = V / sqrt(f1*f2*f3)
+            r2n_gpu.run(fc3_gpu_6d, grid_triplet, method="super_fast")
+            fc3_normal_squared_gpu = r2n_gpu.get_reciprocal_to_normal_squared()
+            
+            print(f"GPU fc3_normal_squared shape: {fc3_normal_squared_gpu.shape}")
+            print(f"GPU fc3_normal_squared dtype: {fc3_normal_squared_gpu.dtype}")
+            
+            print(f"\nPython |fc3_normal|^2 first 5 elements: {fc3_normal_squared_py.flatten()[:5]}")
+            print(f"GPU fc3_normal_squared first 5 elements: {fc3_normal_squared_gpu.flatten()[:5]}")
+            
+            # Find non-zero elements for better comparison
+            py_nonzero = fc3_normal_squared_py[fc3_normal_squared_py > 1e-20]
+            gpu_nonzero = fc3_normal_squared_gpu[fc3_normal_squared_gpu > 1e-20]
+            print(f"\nPython non-zero count: {len(py_nonzero)}")
+            print(f"GPU non-zero count: {len(gpu_nonzero)}")
+            
+            if len(py_nonzero) > 0:
+                print(f"Python non-zero range: [{py_nonzero.min():.6e}, {py_nonzero.max():.6e}]")
+            if len(gpu_nonzero) > 0:
+                print(f"GPU non-zero range: [{gpu_nonzero.min():.6e}, {gpu_nonzero.max():.6e}]")
+            
+            # Compare
+            v2_diff = np.abs(fc3_normal_squared_py - fc3_normal_squared_gpu)
+            print(f"\nMax |py - gpu|: {v2_diff.max():.6e}")
+            print(f"Mean |py - gpu|: {v2_diff.mean():.6e}")
+            
+            # Relative error where Python is non-zero
+            mask = fc3_normal_squared_py > 1e-20
+            if mask.any():
+                rel_err = v2_diff[mask] / fc3_normal_squared_py[mask]
+                print(f"Max relative error (where py > 1e-20): {rel_err.max():.6e}")
+                print(f"Mean relative error: {rel_err.mean():.6e}")
+            
+            if v2_diff.max() > 1e-8:
+                print("\nWARNING: fc3_normal_squared differs significantly!")
+                max_idx = np.unravel_index(np.argmax(v2_diff), v2_diff.shape)
+                print(f"Max diff at index {max_idx}")
+                print(f"  Python: {fc3_normal_squared_py[max_idx]:.10e}")
+                print(f"  GPU:    {fc3_normal_squared_gpu[max_idx]:.10e}")
+            else:
+                print("\nOK: fc3_normal_squared matches within tolerance")
+            
+            # Store in interaction_strength (using GPU result to validate full GPU path)
+            self._interaction_strength[i] = fc3_normal_squared_gpu * self._unit_conversion
+            
+            # # Only test first triplet for debugging
+            # print("\n" + "=" * 60)
+            # print("Stopping after first triplet for debugging")
+            # print("=" * 60)
+            # break
 
     def _run_phonon_solver_py(self, grid_point):
         run_phonon_solver_py(

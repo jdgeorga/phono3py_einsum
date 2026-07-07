@@ -3,6 +3,8 @@
 
 /* This file is part of phonopy. */
 
+// #define MEASURE_R2N
+
 /* Redistribution and use in source and binary forms, with or without */
 /* modification, are permitted provided that the following conditions */
 /* are met: */
@@ -37,6 +39,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "bzgrid.h"
 #include "imag_self_energy_with_g.h"
@@ -45,6 +49,13 @@
 #include "real_to_reciprocal.h"
 #include "recgrid.h"
 #include "reciprocal_to_normal.h"
+
+/* Global variables for capturing fc3_reciprocal */
+static int64_t capture_fc3_reciprocal_enabled = 0;
+static lapack_complex_double *captured_fc3_reciprocal = NULL;
+static double captured_q_vecs[3][3];
+static int64_t captured_size = 0;
+static int64_t captured_num_band = 0;
 
 static const int64_t index_exchange[6][3] = {{0, 1, 2}, {2, 0, 1}, {1, 2, 0},
                                              {2, 1, 0}, {0, 2, 1}, {1, 0, 2}};
@@ -59,7 +70,7 @@ static void real_to_normal(
     const int64_t *band_indices, const int64_t num_band0,
     const int64_t num_band, const double cutoff_frequency,
     const int64_t triplet_index, const int64_t num_triplets,
-    const int64_t openmp_per_triplets);
+    const int64_t openmp_per_triplets, const lapack_complex_double *fc3_reciprocal_input);
 static void real_to_normal_sym_q(
     double *fc3_normal_squared, const int64_t (*g_pos)[4],
     const int64_t num_g_pos, double *const freqs[3],
@@ -69,11 +80,12 @@ static void real_to_normal_sym_q(
     const int64_t *band_indices, const int64_t num_band0,
     const int64_t num_band, const double cutoff_frequency,
     const int64_t triplet_index, const int64_t num_triplets,
-    const int64_t openmp_per_triplets);
+    const int64_t openmp_per_triplets, const lapack_complex_double *fc3_reciprocal_input);
 
 /* fc3_normal_squared[num_triplets, num_band0, num_band, num_band] */
+/* fc3_reciprocal[num_triplets, num_atom, num_atom, num_atom,3,3,3] */
 void itr_get_interaction(
-    Darray *fc3_normal_squared, const char *g_zero, const Darray *frequencies,
+    Darray *fc3_normal_squared, const lapack_complex_double *fc3_reciprocal, const char *g_zero, const Darray *frequencies,
     const lapack_complex_double *eigenvectors, const int64_t (*triplets)[3],
     const int64_t num_triplets, const RecgridConstBZGrid *bzgrid,
     const double *fc3, const int64_t is_compact_fc3,
@@ -83,13 +95,18 @@ void itr_get_interaction(
     int64_t (*g_pos)[4];
     int64_t i;
     int64_t num_band, num_band0, num_band_prod, num_g_pos;
+    int64_t num_atom, fc3_reciprocal_triplet_size;
 
     g_pos = NULL;
 
     num_band0 = fc3_normal_squared->dims[1];
     num_band = frequencies->dims[1];
     num_band_prod = num_band0 * num_band * num_band;
+    num_atom = num_band / 3;  /* num_band = num_atom * 3 */
+    fc3_reciprocal_triplet_size = num_atom * num_atom * num_atom * 3 * 3 * 3;
 
+    // printf("DEBUG num_triplets = %ld\n", num_triplets);
+    // fflush(stdout);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(guided) \
     private(num_g_pos, g_pos) if (openmp_per_triplets)
@@ -99,12 +116,15 @@ void itr_get_interaction(
         num_g_pos = ise_set_g_pos(g_pos, num_band0, num_band,
                                   g_zero + i * num_band_prod);
 
+        // printf("DEBUG triplet: i = %ld, g_pos = %p\n", i, (void *)g_pos);
+        // fflush(stdout);
+
         itr_get_interaction_at_triplet(
             fc3_normal_squared->data + i * num_band_prod, num_band0, num_band,
             g_pos, num_g_pos, frequencies->data, eigenvectors, triplets[i],
             bzgrid, fc3, is_compact_fc3, atom_triplets, masses, band_indices,
             symmetrize_fc3_q, cutoff_frequency, i, num_triplets,
-            openmp_per_triplets);
+            openmp_per_triplets, fc3_reciprocal + i * fc3_reciprocal_triplet_size);
 
         free(g_pos);
         g_pos = NULL;
@@ -122,7 +142,7 @@ void itr_get_interaction_at_triplet(
     const double cutoff_frequency,
     const int64_t triplet_index, /* only for print */
     const int64_t num_triplets,  /* only for print */
-    const int64_t openmp_per_triplets) {
+    const int64_t openmp_per_triplets, const lapack_complex_double *fc3_reciprocal) {
     int64_t j, k;
     double *freqs[3];
     lapack_complex_double *eigvecs[3];
@@ -162,7 +182,8 @@ void itr_get_interaction_at_triplet(
             fc3_normal_squared, g_pos, num_g_pos, freqs, eigvecs, fc3,
             is_compact_fc3, q_vecs, /* q0, q1, q2 */
             atom_triplets, masses, band_indices, num_band0, num_band,
-            cutoff_frequency, triplet_index, num_triplets, openmp_per_triplets);
+            cutoff_frequency, triplet_index, num_triplets, openmp_per_triplets,
+            fc3_reciprocal);
         for (j = 0; j < 3; j++) {
             free(freqs[j]);
             freqs[j] = NULL;
@@ -170,6 +191,8 @@ void itr_get_interaction_at_triplet(
             eigvecs[j] = NULL;
         }
     } else {
+        // printf("DEBUG CAPTURE: triplet = [%ld, %ld, %ld]\n", triplet[0], triplet[1], triplet[2]);
+        // fflush(stdout);
         real_to_normal(fc3_normal_squared, g_pos, num_g_pos,
                        frequencies + triplet[0] * num_band,
                        frequencies + triplet[1] * num_band,
@@ -180,7 +203,7 @@ void itr_get_interaction_at_triplet(
                        is_compact_fc3, q_vecs, /* q0, q1, q2 */
                        atom_triplets, masses, band_indices, num_band0, num_band,
                        cutoff_frequency, triplet_index, num_triplets,
-                       openmp_per_triplets);
+                       openmp_per_triplets, fc3_reciprocal);
     }
 }
 
@@ -195,33 +218,72 @@ static void real_to_normal(
     const int64_t *band_indices, const int64_t num_band0,
     const int64_t num_band, const double cutoff_frequency,
     const int64_t triplet_index, const int64_t num_triplets,
-    const int64_t openmp_per_triplets) {
+    const int64_t openmp_per_triplets, const lapack_complex_double *fc3_reciprocal_input) {
     lapack_complex_double *fc3_reciprocal;
     lapack_complex_double comp_zero;
     int64_t i;
 
+    /* Use the passed fc3_reciprocal_input instead of allocating new memory */
+    /* The input has shape (num_atom, num_atom, num_atom, 3, 3, 3) which is equivalent to */
+    /* (num_band, num_band, num_band) where num_band = num_atom * 3 */
+    fc3_reciprocal = (lapack_complex_double *)fc3_reciprocal_input;
+    
     comp_zero = lapack_make_complex_double(0, 0);
-    fc3_reciprocal = (lapack_complex_double *)malloc(
-        sizeof(lapack_complex_double) * num_band * num_band * num_band);
     for (i = 0; i < num_band * num_band * num_band; i++) {
         fc3_reciprocal[i] = comp_zero;
     }
+    
+    // printf("DEBUG CAPTURE: qvecs[0] = [%f, %f, %f]\n", q_vecs[0][0], q_vecs[0][1], q_vecs[0][2]);
+    // printf("DEBUG CAPTURE: qvecs[1] = [%f, %f, %f]\n", q_vecs[1][0], q_vecs[1][1], q_vecs[1][2]); 
+    // printf("DEBUG CAPTURE: qvecs[2] = [%f, %f, %f]\n", q_vecs[2][0], q_vecs[2][1], q_vecs[2][2]);
+    // fflush(stdout);
+
+
+    // printf("DEBUG CAPTURE: First 5 elements of fc3:\n");
+    // for (i = 0; i < 5; i++) {
+    //     printf("DEBUG CAPTURE: fc3[%ld] = %f\n", i, fc3[i]);
+    // }
+    // fflush(stdout);
+
     r2r_real_to_reciprocal(fc3_reciprocal, q_vecs, fc3, is_compact_fc3,
                            atom_triplets, openmp_per_triplets);
 
+    /* Capture fc3_reciprocal if enabled */
+    // printf("DEBUG CAPTURE: capture_fc3_reciprocal_enabled = %ld\n", capture_fc3_reciprocal_enabled);
+    // printf("DEBUG CAPTURE: num_band = %ld\n", num_band);
+    // fflush(stdout);
+    
+    // printf("DEBUG CAPTURE: reciprocal_to_normal_squared() called\n");
+    // printf("DEBUG CAPTURE: freqs0 = %f\n", freqs0[0]);
+    // printf("DEBUG CAPTURE: freqs1 = %f\n", freqs1[0]);
+    // printf("DEBUG CAPTURE: freqs2 = %f\n", freqs2[0]);
+    // printf("DEBUG CAPTURE: eigvecs0 = %f\n", eigvecs0[0]);
+    // printf("DEBUG CAPTURE: eigvecs1 = %f\n", eigvecs1[0]);
+    // printf("DEBUG CAPTURE: eigvecs2 = %f\n", eigvecs2[0]);
+    // printf("DEBUG CAPTURE: fc3_reciprocal = %f\n", fc3_reciprocal[0]);  
+    // printf("DEBUG CAPTURE: fc3_reciprocal = %f\n", fc3_reciprocal[1]);  
+    // printf("DEBUG CAPTURE: fc3_reciprocal = %f\n", fc3_reciprocal[2]);  
+    // fflush(stdout);
+
 #ifdef MEASURE_R2N
-    if ((!openmp_per_triplets) && num_triplets > 0) {
-        printf("At triplet %d/%d (# of bands=%d):\n", triplet_index,
-               num_triplets, num_band0);
+    if (num_triplets > 0) {
+#ifdef _OPENMP
+        #pragma omp critical
+#endif
+        // {
+        //     printf("At triplet %ld/%ld (# of bands=%ld):\n", triplet_index + 1,
+        //            num_triplets, num_band0);
+        //     fflush(stdout);
+        // }
     }
 #endif
+
     reciprocal_to_normal_squared(
         fc3_normal_squared, g_pos, num_g_pos, fc3_reciprocal, freqs0, freqs1,
         freqs2, eigvecs0, eigvecs1, eigvecs2, masses, band_indices, num_band0,
         num_band, cutoff_frequency, openmp_per_triplets);
 
-    free(fc3_reciprocal);
-    fc3_reciprocal = NULL;
+    /* No need to free fc3_reciprocal since we're using the passed pointer */
 }
 
 static void real_to_normal_sym_q(
@@ -233,7 +295,7 @@ static void real_to_normal_sym_q(
     const int64_t *band_indices, const int64_t num_band0,
     const int64_t num_band, const double cutoff_frequency,
     const int64_t triplet_index, const int64_t num_triplets,
-    const int64_t openmp_per_triplets) {
+    const int64_t openmp_per_triplets, const lapack_complex_double *fc3_reciprocal_input) {
     int64_t i, j, k, l;
     int64_t band_ex[3];
     double q_vecs_ex[3][3];
@@ -247,11 +309,23 @@ static void real_to_normal_sym_q(
     }
 
     for (i = 0; i < 6; i++) {
+        lapack_complex_double *fc3_reciprocal_temp = NULL;
+        
         for (j = 0; j < 3; j++) {
             for (k = 0; k < 3; k++) {
                 q_vecs_ex[j][k] = q_vecs[index_exchange[i][j]][k];
             }
         }
+        
+        /* For the first iteration, use the passed fc3_reciprocal_input, */
+        /* for others, allocate temporary arrays */
+        if (i == 0) {
+            fc3_reciprocal_temp = (lapack_complex_double *)fc3_reciprocal_input;
+        } else {
+            fc3_reciprocal_temp = (lapack_complex_double *)malloc(
+                sizeof(lapack_complex_double) * num_band * num_band * num_band);
+        }
+        
         real_to_normal(
             fc3_normal_squared_ex, g_pos, num_g_pos,
             freqs[index_exchange[i][0]], freqs[index_exchange[i][1]],
@@ -259,7 +333,8 @@ static void real_to_normal_sym_q(
             eigvecs[index_exchange[i][1]], eigvecs[index_exchange[i][2]], fc3,
             is_compact_fc3, q_vecs_ex, /* q0, q1, q2 */
             atom_triplets, masses, band_indices, num_band0, num_band,
-            cutoff_frequency, triplet_index, num_triplets, openmp_per_triplets);
+            cutoff_frequency, triplet_index, num_triplets, openmp_per_triplets,
+            fc3_reciprocal_temp);
         for (j = 0; j < num_band0; j++) {
             for (k = 0; k < num_band; k++) {
                 for (l = 0; l < num_band; l++) {
@@ -277,7 +352,89 @@ static void real_to_normal_sym_q(
                 }
             }
         }
+        
+        /* Free temporary fc3_reciprocal arrays (except for i=0 which uses the passed pointer) */
+        if (i != 0 && fc3_reciprocal_temp != NULL) {
+            free(fc3_reciprocal_temp);
+            fc3_reciprocal_temp = NULL;
+        }
     }
 
     free(fc3_normal_squared_ex);
+}
+
+/* Functions for capturing fc3_reciprocal during interaction calculation */
+void itr_enable_fc3_reciprocal_capture(void) {
+    capture_fc3_reciprocal_enabled = 1;
+    // printf("DEBUG CAPTURE: itr_enable_fc3_reciprocal_capture() called, enabled = %ld\n", capture_fc3_reciprocal_enabled);
+    // fflush(stdout);
+}
+
+void itr_disable_fc3_reciprocal_capture(void) {
+    capture_fc3_reciprocal_enabled = 0;
+    // printf("DEBUG CAPTURE: itr_disable_fc3_reciprocal_capture() called, enabled = %ld\n", capture_fc3_reciprocal_enabled);
+    // fflush(stdout);
+}
+
+int64_t itr_get_captured_fc3_reciprocal(lapack_complex_double *fc3_reciprocal_out, 
+                                        double *q_vecs_out, int64_t max_size) {
+    int64_t i, j;
+    
+    // printf("DEBUG CAPTURE: itr_get_captured_fc3_reciprocal() called\n");
+    // printf("DEBUG CAPTURE: captured_fc3_reciprocal = %p, captured_size = %ld\n", 
+    //        captured_fc3_reciprocal, captured_size);
+    // fflush(stdout);
+    
+    if (!captured_fc3_reciprocal || captured_size == 0) {
+        // printf("DEBUG CAPTURE: No data captured to return\n");
+        // fflush(stdout);
+        return 0;  /* No data captured */
+    }
+    
+    /* Query mode: If output pointers are NULL, just return the captured size */
+    if (fc3_reciprocal_out == NULL || q_vecs_out == NULL) {
+        // printf("DEBUG CAPTURE: Query mode - returning captured size = %ld\n", captured_size);
+        // fflush(stdout);
+        return captured_size;
+    }
+    
+    if (max_size < captured_size) {
+        // printf("DEBUG CAPTURE: Output buffer too small: max_size=%ld, captured_size=%ld\n", 
+        //        max_size, captured_size);
+        // fflush(stdout);
+        return -1;  /* Output buffer too small */
+    }
+    
+    /* Copy fc3_reciprocal data */
+    for (i = 0; i < captured_size; i++) {
+        fc3_reciprocal_out[i] = captured_fc3_reciprocal[i];
+    }
+    
+    /* Copy q_vecs data */
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            q_vecs_out[i * 3 + j] = captured_q_vecs[i][j];
+        }
+    }
+    
+    // printf("DEBUG CAPTURE: Successfully returned captured data, size = %ld\n", captured_size);
+    // fflush(stdout);
+    return captured_size;
+}
+
+void itr_clear_captured_fc3_reciprocal(void) {
+    // printf("DEBUG CAPTURE: itr_clear_captured_fc3_reciprocal() called\n");
+    // fflush(stdout);
+    
+    if (captured_fc3_reciprocal) {
+        // printf("DEBUG CAPTURE: Freeing previous captured data\n");
+        // fflush(stdout);
+        free(captured_fc3_reciprocal);
+        captured_fc3_reciprocal = NULL;
+    }
+    captured_size = 0;
+    captured_num_band = 0;
+    
+    // printf("DEBUG CAPTURE: Clear completed\n");
+    // fflush(stdout);
 }

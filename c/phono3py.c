@@ -59,7 +59,7 @@
 #endif
 
 int64_t ph3py_get_interaction(
-    Darray *fc3_normal_squared, const char *g_zero, const Darray *frequencies,
+    Darray *fc3_normal_squared, const _lapack_complex_double *fc3_reciprocal, const char *g_zero, const Darray *frequencies,
     const _lapack_complex_double *eigenvectors, const int64_t (*triplets)[3],
     const int64_t num_triplets, const int64_t (*bz_grid_addresses)[3],
     const int64_t D_diag[3], const int64_t Q[3][3], const double *fc3,
@@ -105,7 +105,7 @@ int64_t ph3py_get_interaction(
     atom_triplets->all_shortest = all_shortest;
     atom_triplets->nonzero_indices = fc3_nonzero_indices;
 
-    itr_get_interaction(fc3_normal_squared, g_zero, frequencies,
+    itr_get_interaction(fc3_normal_squared, (const lapack_complex_double *)fc3_reciprocal, g_zero, frequencies,
                         (lapack_complex_double *)eigenvectors, triplets,
                         num_triplets, bzgrid, fc3, is_compact_fc3,
                         atom_triplets, masses, band_indices, symmetrize_fc3_q,
