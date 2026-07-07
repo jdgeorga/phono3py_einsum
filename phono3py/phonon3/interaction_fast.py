@@ -47,7 +47,7 @@ from phonopy.physical_units import get_physical_units
 from phonopy.structure.cells import Primitive, compute_all_sg_permutations
 from phonopy.structure.symmetry import Symmetry
 
-from phono3py.phonon.grid import (
+from phonopy.phonon.grid import (
     BZGrid,
     get_grid_points_by_rotations,
     get_ir_grid_points,
@@ -180,11 +180,13 @@ class Interaction:
         cutoff_frequency: float | None = None,
         lapack_zheev_uplo: Literal["L", "U"] = "L",
         openmp_per_triplets: bool | None = None,
+        lang=None,
     ):
         """Init method."""
         self._primitive = primitive
         self._bz_grid = bz_grid
         self._primitive_symmetry = primitive_symmetry
+        self._lang = lang
 
         self._band_indices = self._get_band_indices(band_indices)
         self._constant_averaged_interaction = constant_averaged_interaction
@@ -270,6 +272,13 @@ class Interaction:
         if self._triplets_at_q is None:
             raise RuntimeError("Set grid point first by set_grid_point().")
 
+        # This fork's Interaction implements the backends enumerated below.
+        # Upstream v4.2.0 introduced a "Rust" default (and a "Python" option)
+        # that this fork never implemented; normalize any such value to the
+        # standard "C" path so ph-ph setup never crashes on a non-GPU default.
+        if lang not in ("C", "Fast", "V3", "GPU", "GPU_phase", "Hybrid"):
+            lang = "C"
+
         num_band = len(self._primitive) * 3
         num_triplets = len(self._triplets_at_q)
 
@@ -310,8 +319,11 @@ class Interaction:
             elif lang == "Hybrid":
                 self._run_hybrid(g_zero)
             else:
-                # self _run_py() # original py implementation JDG Dec 9 2025
-                self._run_py_test() # new py test JDG Dec 9 2025
+                # Unreachable: lang is normalized to a supported backend above.
+                # (The old default here, _run_py_test(), was dev-only
+                # Python-vs-GPU reference scaffolding assuming the 3.15.1 fc3
+                # layout — not a production path.)
+                raise NotImplementedError(f"Unsupported interaction lang: {lang!r}")
         else:
             num_grid = np.prod(self.mesh_numbers)
             self._interaction_strength[:] = (
@@ -817,8 +829,8 @@ class Interaction:
         # perms.shape = (len(spg_ops), len(primitive)), dtype='intc'
         perms = compute_all_sg_permutations(
             self._primitive.scaled_positions,
-            self._bz_grid.symmetry_dataset.rotations,  # type: ignore
-            self._bz_grid.symmetry_dataset.translations,  # type: ignore
+            self._bz_grid.grid_symmetry_dataset.rotations,  # type: ignore
+            self._bz_grid.grid_symmetry_dataset.translations,  # type: ignore
             np.array(self._primitive.cell.T, dtype="double", order="C"),
             symprec=self._symprec,
         )
@@ -866,13 +878,13 @@ class Interaction:
 
         """
         d2r_map = []
-        for r in self._bz_grid.symmetry_dataset.rotations:  # type: ignore
+        for r in self._bz_grid.grid_symmetry_dataset.rotations:  # type: ignore
             for i, rec_r in enumerate(self._bz_grid.reciprocal_operations):
                 if (rec_r.T == r).all():
                     d2r_map.append(i)
                     break
 
-        assert len(d2r_map) == len(self._bz_grid.symmetry_dataset.rotations)  # type: ignore
+        assert len(d2r_map) == len(self._bz_grid.grid_symmetry_dataset.rotations)  # type: ignore
 
         return d2r_map
 
@@ -887,7 +899,7 @@ class Interaction:
         assert self._eigenvectors is not None
 
         Rq = np.dot(self._bz_grid.QDinv, self._bz_grid.addresses[bzgp])
-        tau = self._bz_grid.symmetry_dataset.translations[t_i]  # type: ignore
+        tau = self._bz_grid.grid_symmetry_dataset.translations[t_i]  # type: ignore
         phase_factor = np.exp(-2j * np.pi * np.dot(Rq, tau))
         self._phonon_done[bzgp] = 1
         self._frequencies[bzgp, :] = self._frequencies[orig_gp, :]

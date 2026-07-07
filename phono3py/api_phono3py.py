@@ -2074,7 +2074,9 @@ class Phono3py:
         keep_gamma_detail: bool = False,
         keep_reduced_gamma_detail: bool = False,
         output_filename: str | None = None,
-        lang: Literal["C", "Python", "Rust", "GPU", "GPU_phase", "Hybrid"] = "C",
+        lang: Literal[
+            "C", "Python", "Rust", "GPU", "GPU_phase", "Hybrid"
+        ] | None = None,
     ) -> ImagSelfEnergyValues:
         """Calculate the imaginary part of the bubble self-energy (Gamma).
 
@@ -2137,7 +2139,8 @@ class Phono3py:
             Inserted into output filenames.
         lang : str, optional
             Backend selection. ``"C"``, ``"Python"``, ``"Rust"``, ``"GPU"``,
-            ``"GPU_phase"``, and ``"Hybrid"`` are accepted. Default is ``"C"``.
+            ``"GPU_phase"``, and ``"Hybrid"`` are accepted. Default is
+            the instance backend.
 
         Returns
         -------
@@ -2158,6 +2161,8 @@ class Phono3py:
                 "before running this method."
             )
             raise RuntimeError(msg)
+
+        lang = lang if lang is not None else self._lang
 
         if temperatures is None:
             self._temperatures = np.array([300.0], dtype="double")
