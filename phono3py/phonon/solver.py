@@ -15,6 +15,8 @@ from phonopy.harmonic.dynamical_matrix import (
 )
 from phonopy.physical_units import get_physical_units
 
+from phono3py.phonon.dynamical_matrix_loto_2d import DynamicalMatrixQELoto2D
+
 
 def run_phonon_solver_c(
     dm: DynamicalMatrix,
@@ -67,6 +69,25 @@ def run_phonon_solver_c(
         _frequency_conversion_factor = get_physical_units().DefaultToTHz
     else:
         _frequency_conversion_factor = frequency_conversion_factor
+
+    # phono3c only knows phonopy's plain and 3D-NAC layouts.  QE 2D NAC is a
+    # fork-local NumPy dynamical-matrix builder, so intercept it before
+    # _extract_params and the compiled dispatch can silently drop its term.
+    if isinstance(dm, DynamicalMatrixQELoto2D):
+        requested = np.asarray(grid_points, dtype="int64")
+        undone = np.unique(requested[phonon_done[requested] == 0])
+        if len(undone) == 0:
+            return
+        qpoints = np.asarray(grid_address[undone] @ QDinv.T, dtype="double")
+        dms = dm.get_dynamical_matrices(qpoints)
+        eigvals, vecs = diagonalize_dynamical_matrices(dms, with_eigenvectors=True)
+        assert vecs is not None
+        frequencies[undone] = (
+            np.sign(eigvals) * np.sqrt(np.abs(eigvals)) * _frequency_conversion_factor
+        )
+        eigenvectors[undone] = vecs
+        phonon_done[undone] = 1
+        return
 
     (
         svecs,
@@ -208,6 +229,18 @@ def run_phonon_solver_rust(
     requested = np.asarray(grid_points, dtype="int64")
     undone = np.unique(requested[phonon_done[requested] == 0])
     if len(undone) == 0:
+        return
+
+    if isinstance(dm, DynamicalMatrixQELoto2D):
+        qpoints = np.asarray(grid_address[undone] @ QDinv.T, dtype="double")
+        dms = dm.get_dynamical_matrices(qpoints)
+        eigvals, vecs = diagonalize_dynamical_matrices(dms, with_eigenvectors=True)
+        assert vecs is not None
+        frequencies[undone] = (
+            np.sign(eigvals) * np.sqrt(np.abs(eigvals)) * _frequency_conversion_factor
+        )
+        eigenvectors[undone] = vecs
+        phonon_done[undone] = 1
         return
 
     (

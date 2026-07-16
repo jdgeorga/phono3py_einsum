@@ -7,7 +7,7 @@ from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from phonopy.harmonic.dynamical_matrix import DynamicalMatrix, get_dynamical_matrix
+from phonopy.harmonic.dynamical_matrix import DynamicalMatrix
 from phonopy.phonon.grid import (
     BZGrid,
     get_grid_points_by_rotations,
@@ -18,6 +18,7 @@ from phonopy.structure.cells import Primitive, Supercell
 from phonopy.structure.symmetry import Symmetry
 
 from phono3py._lang import log_dispatch, resolve_lang
+from phono3py.phonon.dynamical_matrix_loto_2d import get_phph_dynamical_matrix
 from phono3py.phonon.solver import (
     run_phonon_solver_c,
     run_phonon_solver_py,
@@ -639,7 +640,7 @@ class Interaction:
         """
         self._nac_params = nac_params
         _dm_lang: Literal["C", "Rust"] = "Rust" if self._lang == "Rust" else "C"
-        self._dm = get_dynamical_matrix(
+        self._dm = get_phph_dynamical_matrix(
             fc2,
             supercell,
             primitive,

@@ -42,10 +42,12 @@ import numpy as np
 import multiprocessing as mp
 from functools import partial
 from numpy.typing import NDArray
-from phonopy.harmonic.dynamical_matrix import DynamicalMatrix, get_dynamical_matrix
+from phonopy.harmonic.dynamical_matrix import DynamicalMatrix
 from phonopy.physical_units import get_physical_units
 from phonopy.structure.cells import Primitive, compute_all_sg_permutations
 from phonopy.structure.symmetry import Symmetry
+
+from phono3py.phonon.dynamical_matrix_loto_2d import get_phph_dynamical_matrix
 
 from phonopy.phonon.grid import (
     BZGrid,
@@ -713,7 +715,7 @@ class Interaction:
 
         """
         self._nac_params = nac_params
-        self._dm = get_dynamical_matrix(
+        self._dm = get_phph_dynamical_matrix(
             fc2,
             supercell,
             primitive,
